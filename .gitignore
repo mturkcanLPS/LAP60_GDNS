@@ -1,0 +1,15 @@
+# colcon çıktıları — kaynaktan yeniden üretilir, repoya girmez
+build/
+install/
+log/
+colcon/
+
+# Python artıkları
+__pycache__/
+*.pyc
+
+# Analiz ara çıktıları (video/ölçüm verileri repo dışı)
+*.npy
+*.avi
+*.png
+/colcon
