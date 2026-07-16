@@ -14,8 +14,8 @@ Jetson'un başına bir şey gelirse sıfır karttan uçuşa dönüş adımları.
 
 ## Yedekler nerede?
 
-1. **Kaynak kod**: git remote → `<REPO_URL_BURAYA>` (ros2_ws tamamı)
-2. **Docker imajı — registry**: `<REGISTRY_IMAGE_BURAYA>`
+1. **Kaynak kod**: git remote → `https://github.com/mrctrkcn/lps-jetson.git` (ros2_ws tamamı)
+2. **Docker imajı — registry**: `ghcr.io/mrctrkcn/lps-jetson:v1`
 3. **Docker imajı — tar**: Google Drive + saha USB belleği (`lps-jetson-v1.tar.gz`)
 
 İmaj tar'ı üretme (yedek tazelerken):
@@ -31,7 +31,7 @@ docker save lps-jetson:v1 | gzip > lps-jetson-v1.tar.gz
    Kullanıcı adını `lapis` yap (yollar `/home/lapis/...` sabit).
 2. **Kaynağı al**:
    ```bash
-   git clone <REPO_URL_BURAYA> ~/ros2_ws
+   git clone https://github.com/mrctrkcn/lps-jetson.git ~/ros2_ws
    ```
 3. **Bootstrap** (docker, nvidia runtime, udev, imaj, otomatik başlatma):
    ```bash
@@ -39,6 +39,9 @@ docker save lps-jetson:v1 | gzip > lps-jetson-v1.tar.gz
    ./bootstrap.sh                    # internet varsa registry'den
    ./bootstrap.sh lps-jetson-v1.tar.gz   # yoksa USB'deki tar'dan
    ```
+   Not: GHCR imajı private — registry'den çekmeden önce
+   `sudo docker login ghcr.io` (kullanıcı: mrctrkcn, şifre: GitHub
+   PAT, `read:packages` yetkili). Tar'dan yüklemede login gerekmez.
 4. **Donanımı tak**: RealSense USB3 porta, otopilot UART `/dev/ttyTHS1`
    (pin bağlantısı değişmediyse ekstra ayar yok).
 5. **Doğrulama** (uçuş öncesi zorunlu):

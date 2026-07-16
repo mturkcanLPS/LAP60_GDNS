@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # Registry adresi netleşince doldurulacak (örn. docker.io/KULLANICI/lps-jetson:v1)
-REGISTRY_IMAGE=""
+REGISTRY_IMAGE="ghcr.io/mrctrkcn/lps-jetson:v1"
 IMAGE_TAG="lps-jetson:v1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -34,9 +34,12 @@ if ! command -v nvidia-container-runtime >/dev/null; then
     log "nvidia-container-toolkit kuruluyor..."
     sudo apt-get install -y nvidia-container-toolkit
 fi
-if ! grep -q '"nvidia"' /etc/docker/daemon.json 2>/dev/null; then
-    log "Docker'a nvidia runtime tanitiliyor..."
-    sudo nvidia-ctk runtime configure --runtime=docker
+# --set-as-default sart: VPI'li imaj Jetson'da YENIDEN derlenecekse build
+# adimlarinin L4T surucu kutuphanelerini gormesi gerekir (runc'de linker
+# NvRm/NvMedia sembollerini bulamaz).
+if ! grep -q '"default-runtime": "nvidia"' /etc/docker/daemon.json 2>/dev/null; then
+    log "Docker'a nvidia runtime tanitiliyor (default)..."
+    sudo nvidia-ctk runtime configure --runtime=docker --set-as-default
     sudo systemctl restart docker
 fi
 sudo systemctl enable --now docker
