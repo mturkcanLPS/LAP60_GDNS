@@ -1,0 +1,4 @@
+# Build context = ws kökü; imaja yalnız src/ ve docker/ girer
+*
+!src
+!docker

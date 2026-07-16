@@ -1,0 +1,40 @@
+# LPS uçuş sistemi — tek container: RealSense + AprilTag + serial_sender
+#
+# Kullanım (ws kökünden):
+#   docker compose -f docker/docker-compose.yml build       # imajı derle
+#   docker compose -f docker/docker-compose.yml up -d       # başlat (boot'ta da kalkar)
+#   docker compose -f docker/docker-compose.yml logs -f     # canlı log
+#   docker compose -f docker/docker-compose.yml down        # durdur
+
+services:
+  lps:
+    image: lps-jetson:v1
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+
+    # GPU + VPI/OFA erişimi: Jetson nvidia-container-runtime host sürücü
+    # katmanını ve /dev/nvhost-* düğümlerini içeri map'ler.
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+
+    # DDS host ağında: host'tan `ros2 topic echo` ile debug mümkün kalır.
+    network_mode: host
+    ipc: host
+
+    # Güç kesilip gelse, container çökse de docker geri kaldırır.
+    # Boot'ta otomatik başlama = docker.service enabled + bu policy.
+    restart: unless-stopped
+
+    devices:
+      - /dev/ttyTHS1:/dev/ttyTHS1          # otopilot UART
+
+    # RealSense: tek device yerine USB bus mount + cgroup kuralı —
+    # uçuşta USB kopup gelirse cihaz yeni numarayla döner, yine erişilir.
+    device_cgroup_rules:
+      - "c 189:* rmw"
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - /home/lapis/lps_records:/home/lapis/lps_records   # video + camwd.log kalıcı
