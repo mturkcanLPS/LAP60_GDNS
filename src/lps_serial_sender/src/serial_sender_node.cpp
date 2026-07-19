@@ -85,7 +85,7 @@ public:
         // hrvs + apriltag + opticflow timestamp'leri = bu andan itibaren ms.
         // Boylece hepsi 0 civarindan baslar, ayni tabanda karsilastirilabilir
         // (orn. sensor gecikmesi = hrvs.timeStamp - apriltag.timeStamp).
-        t0_ns_ = (uint64_t)this->now().nanoseconds();
+        t0_ns_ = (int64_t)this->now().nanoseconds();
 
         serial_port_  = declare_parameter<std::string>("serial_port",  "/dev/ttyTHS1");
         baud_rate_    = declare_parameter<int>   ("baud_rate",    115200);
@@ -511,9 +511,13 @@ private:
         for (int i = 0; i < 3; ++i) hsum += pkt.data[i];
         pkt.pack.header.headerchk = static_cast<uint8_t>(~(hsum % 256) + 1);
 
-        // HRVS — paket gonderim ani (uptime ms) + monoton frame sayaci
-        pkt.pack.variables.hrvs.timeStamp  =
-            msSinceStart((uint64_t)this->now().nanoseconds());
+        // HRVS — paket gonderim ani + monoton frame sayaci.
+        // steady_clock: sistem saati step'lerinden etkilenmez (26_07_19
+        // ucusundaki NTP sicramasi ROS clock'u da sicratmisti). Ayni
+        // sifir noktasi (node acilisi), kamera-domain guard'ina girmez.
+        pkt.pack.variables.hrvs.timeStamp  = (uint32_t)
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time_).count();
         pkt.pack.variables.hrvs.frameNumer = frame_number_;
 
         pkt.pack.variables.aprtiltag = at_copy;
@@ -600,13 +604,37 @@ private:
             flow_thr_dbg_.load());
     }
 
-    /** ROS clock timestamp'ini (ns) node-baslangic tabanli ms'ye cevirir.
+    /** Kamera-domain timestamp'ini (ns) node-baslangic tabanli ms'ye cevirir.
      *  Tum paket timestamp'leri bu tabani kullanir — 0'dan baslar,
-     *  ayni tabanda oldugu icin alanlar arasi fark alinabilir. */
-    uint32_t msSinceStart(uint64_t stamp_ns) const
+     *  ayni tabanda oldugu icin alanlar arasi fark alinabilir.
+     *
+     *  SICRAMA KORKULUGU (26_07_19 ucusu: sistem saati ucus ortasinda
+     *  +2g 3.5s step atti, HUD t 18s→185403s; NTP bayat-saat duzeltmesi):
+     *  ardisik damgalar arasi fark ±2 s'yi asarsa taban kaydirilir, eksen
+     *  nominal 33 ms ilerleyerek SUREKLI kalir. Tag damgalari goruntuden
+     *  ~100 ms geride gelir; kucuk negatif farklar normaldir, esige girmez.
+     *  Gecis aninda kuyruktaki eski-domain mesajlari 1-2 rebase daha
+     *  tetikleyebilir; her rebase en fazla 33 ms hata enjekte eder. */
+    uint32_t msSinceStart(uint64_t stamp_ns)
     {
-        if (stamp_ns <= t0_ns_) return 0;
-        return static_cast<uint32_t>((stamp_ns - t0_ns_) / 1000000ULL);
+        static constexpr int64_t kStampJumpNs = 2000000000LL;  // 2 s
+        static constexpr int64_t kNominalDtNs =   33000000LL;  // ~30fps
+        std::lock_guard<std::mutex> lk(ts_guard_mutex_);
+        const int64_t s = (int64_t)stamp_ns;
+        if (last_stamp_ns_ != 0) {
+            const int64_t d = s - last_stamp_ns_;
+            if (d > kStampJumpNs || d < -kStampJumpNs) {
+                t0_ns_ += d - kNominalDtNs;
+                RCLCPP_WARN(get_logger(),
+                    "[TS-GUARD] timestamp sicramasi yutuldu: %+.2f s "
+                    "(saat step'i / surucu domain degisimi). Eksen surekli.",
+                    (double)d / 1e9);
+            }
+        }
+        last_stamp_ns_ = s;
+        const int64_t rel = s - t0_ns_;
+        if (rel <= 0) return 0;
+        return static_cast<uint32_t>(rel / 1000000LL);
     }
 
     /* params */
@@ -692,7 +720,9 @@ private:
     std::vector<lps::DebugRecorder::TagOverlay> tag_overlays_;  // data_mutex_
 
     std::chrono::steady_clock::time_point start_time_;
-    uint64_t t0_ns_ = 0;   // tum timestamp'lerin ortak sifir noktasi (ROS ns)
+    int64_t t0_ns_ = 0;         // ortak sifir noktasi (ns); TS-GUARD kaydirabilir
+    int64_t last_stamp_ns_ = 0; // TS-GUARD: son gorulen kamera-domain damgasi
+    std::mutex ts_guard_mutex_; // msSinceStart cok thread'den cagriliyor
 };
 
 /* ------------------------------------------------------------------ */

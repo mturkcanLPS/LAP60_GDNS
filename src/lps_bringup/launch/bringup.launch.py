@@ -34,6 +34,12 @@ def generate_launch_description():
     # opsiyonlari OTURUM BOYUNCA 10 sn'de bir dogrular, sapmissa geri basar:
     #  - emitter_enabled 0        : dot pattern optik akisi bozar (kamerayla
     #                               birlikte hareket eder, akisi sifira ceker)
+    #  - global_time_enabled false: image stamp'leri KAMERANIN donanim
+    #      saatinden gelsin (host'a hizalama YOK). 26_07_19 ucusu: sahada
+    #      NTP, bayat saati ucus ORTASINDA +2g3.5s step atti; global-time
+    #      kestirimcisi cildirip stamp'leri 18s→2845→48770→252816→185403s
+    #      gezdirdi, otopilot dt'leri coplendi. Cihaz saati step gormez.
+    #      (Node tarafinda ayrica TS-GUARD var — cift emniyet.)
     #  - auto_exposure_limit 2000 : AE acik kalir ama pozlama 2 ms'i asamaz
     #      (gunesli sahnede saturasyonu keser, motion blur'u sinirlar →
     #       AprilTag tespiti hareket halinde yasar).
@@ -60,7 +66,7 @@ def generate_launch_description():
              'N=/camera/camera; '
              'WDLOG=/home/lapis/lps_records/camwd.log; '
              'log() { echo "$(date "+%F %T") $*" | tee -a $WDLOG; }; '
-             'log "[CAM-WD] watchdog basladi (hedef: emitter=0, AE limit=2000us)"; '
+             'log "[CAM-WD] watchdog basladi (hedef: emitter=0, AE limit=2000us, global_time=false)"; '
              'cas() { '                                 # check-and-set
              '  cur=$(timeout 8 ros2 param get $N "$1" 2>/dev/null); '
              '  if echo "$cur" | grep -q "value is: $3"; then return 0; fi; '
@@ -76,6 +82,7 @@ def generate_launch_description():
              '  cas depth_module.emitter_enabled 0 "0" || ok=0; '
              '  cas depth_module.auto_exposure_limit_toggle true "[Tt]rue" || ok=0; '
              '  cas depth_module.auto_exposure_limit 2000 "2000" || ok=0; '
+             '  cas depth_module.global_time_enabled false "[Ff]alse" || ok=0; '
              '  if [ "$ok" != "$prev" ]; then '
              '    if [ "$ok" = "1" ]; then '
              '      log "[CAM-WD] TUM AYARLAR AKTIF"; '
