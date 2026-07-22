@@ -6,9 +6,12 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -86,24 +89,58 @@ inline int openSerial(const std::string &port, int baud)
 }
 
 /**
- * Paketi yazar. Sonuc:
+ * Paketi yazar — TAMAMI cikana kadar israr eder. Sonuc:
  *   WriteResult::OK      — tamami yazildi
- *   WriteResult::PARTIAL — kismi yazildi (kernel TX buffer doldu);
- *                          paket bozuk gitti, firmware sync_byte+chksum ile resync yapar
- *   WriteResult::FAILED  — hic yazilamadi (errno set)
+ *   WriteResult::PARTIAL — butce dolmasina ragmen bitirilemedi (telde kesik
+ *                          paket kaldi); firmware sync_byte+chksum ile resync
+ *                          yapar. ARTIK NADIR olmali — sik goruluyorsa hat
+ *                          gercekten doymus demektir (baud/send_rate orani).
+ *   WriteResult::FAILED  — tek bayt bile yazilamadi (errno set)
  *
- * O_NONBLOCK modda bekleme yapilmaz; sabit frekansli telemetride
- * kismi/başarisiz paketi tamamlamaya calismak yerine drop etmek dogru
- * (bir sonraki tick zaten taze veri gonderir).
+ * NEDEN DONGU (26_07_22 teshisi):
+ * Eskiden tek ::write() cagirilip yarim kalirsa paket "drop" ediliyordu.
+ * Ama O_NONBLOCK write() ya hep ya hic DEGIL: tamponda 100 bayt yer varsa
+ * 163 baytin 100'unu YAZAR, gerisini reddeder — yani "drop" karari
+ * verildiginde o 100 bayt COKTAN telde. Yarim paketi geri almak mumkun
+ * olmadigi icin strateji basindan hataliydi. Loglar bunu dogruladi:
+ * bir oturumda 9 saniyede 350 PARTIAL (~saniyede 40 = pratikte HER paket
+ * kesik) + toplam 878 EAGAIN. Osiloskoptaki bozulmanin kaynagi buydu.
+ *
+ * Cozum pyserial'in (Python testinin temiz cikmasinin sebebi) stratejisi:
+ * yaz, yer kalmadiysa portun bosalmasini bekle (poll POLLOUT), kalani yaz.
+ * Bekleme butce ile sinirli — TX thread'i sonsuza kadar tikamaz.
+ * 163 bayt @115200 ≈ 14 ms'de bosalir; 20 ms butce bir paketlik tam drenaji
+ * kapsar ve 40 Hz'in 25 ms'lik periyodunun altinda kalir.
  */
 enum class WriteResult { OK, PARTIAL, FAILED };
 
-inline WriteResult writePacket(int fd, const uint8_t *data, size_t len)
+inline WriteResult writePacket(int fd, const uint8_t *data, size_t len,
+                               int budget_ms = 20)
 {
-    ssize_t n = ::write(fd, data, len);
-    if (n < 0)                 return WriteResult::FAILED;
-    if ((size_t)n != len)      return WriteResult::PARTIAL;
-    return WriteResult::OK;
+    size_t off = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n > 0) { off += (size_t)n; continue; }
+
+        if (n < 0 && errno == EINTR) continue;   // sinyal kesti — devam
+
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            const int elapsed = (int)std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+            const int remain = budget_ms - elapsed;
+            if (remain <= 0) break;              // butce doldu
+            struct pollfd p{fd, POLLOUT, 0};
+            if (::poll(&p, 1, remain) <= 0) break;
+            continue;                            // port bosaldi — kalani yaz
+        }
+        break;                                   // gercek hata
+    }
+
+    if (off == len) return WriteResult::OK;
+    return off > 0 ? WriteResult::PARTIAL : WriteResult::FAILED;
 }
 
 } // namespace lps
