@@ -56,6 +56,18 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 # --- 4) Kalici dizinler -------------------------------------------------------
 mkdir -p /home/lapis/lps_records
 
+# --- 4b) Saat kilidi servisi --------------------------------------------------
+# Jetson'da DVFS, MAXN modunda bile yukselmiyor; optik akis hatti 48 ms/kare
+# ile kameraya yetisemiyordu. Servis saatleri maks'a kilitliyor (48 -> 30 ms).
+# Kapatmak icin: sudo systemctl disable --now lps-jetson-clocks
+SVC="$SCRIPT_DIR/../system/lps-jetson-clocks.service"
+if [[ -f "$SVC" ]]; then
+    log "Saat kilidi servisi kuruluyor (guc/isi artar — ayrinti: servis dosyasi)"
+    sudo cp "$SVC" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now lps-jetson-clocks
+fi
+
 # --- 5) Imaji getir -----------------------------------------------------------
 if [[ $# -ge 1 && -f "$1" ]]; then
     log "Imaj tar yedeginden yukleniyor: $1"

@@ -1,0 +1,43 @@
+# Jetson saatlerini maksimuma kilitler — optik akis hattinin kamera hizina
+# yetismesi icin.
+#
+# NEDEN: process() kare basina 48.3 ms suruyordu, 30 fps'in butcesi 33.3 ms.
+# Olcum (26_07_24): CPU tarafi sadece 5.4 ms, kalan ~43 ms VPI hattinda.
+# Sebep: guc modu MAXN olmasina RAGMEN DVFS yukselmiyor — yuk altinda bile
+# GPU 408/1020 MHz ve VIC 115/435 MHz'de takili kaliyordu.
+#   jetson_clocks              : 48.3 -> 33.4 ms  (GPU 408 -> 1020 MHz)
+#   + VIC performance governor : 33.4 -> 30.5 ms
+# Net %37. Boylece otopilot 20 Hz yerine ~30 Hz taze akis verisi gorur.
+#
+# BEDELI: guc tuketimi ve isi artar → ucus suresi kisalir. Ucus sonrasi
+# sicakliklara bakip degerlendirin (olcum aninda 51-53 C, fan %33 idi).
+#
+# GERI ALMA (tek komut, yeniden baslatma gerekmez):
+#     sudo systemctl disable --now lps-jetson-clocks
+# Bu, ExecStop ile kurulum aninda saklanan FABRIKA ayarini geri yukler.
+# Tamamen emin olmak isterseniz ayrica reboot: jetson_clocks kalici degildir,
+# yeniden baslatma zaten varsayilana dondurur.
+
+[Unit]
+Description=LPS: Jetson saatlerini maks'a kilitle (optik akis 30 fps icin)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Fabrika ayarini BIR KEZ sakla (dosya varsa dokunma — yanlislikla
+# "maks" durumu varsayilan diye kaydedilmesin).
+ExecStartPre=/bin/sh -c '[ -f /var/lib/lps/jetson_clocks_default.conf ] || { mkdir -p /var/lib/lps && /usr/bin/jetson_clocks --store /var/lib/lps/jetson_clocks_default.conf; }'
+
+ExecStart=/usr/bin/jetson_clocks
+# jetson_clocks VIC'i yukseltmiyor, ayrica gerekiyor
+ExecStart=/bin/sh -c 'echo performance > /sys/class/devfreq/15340000.vic/governor'
+ExecStart=/bin/sh -c 'echo "$(date "+%%F %%T") [CLOCKS] maks kilitlendi: GPU $(cat /sys/devices/platform/17000000.gpu/devfreq/17000000.gpu/cur_freq) VIC $(cat /sys/class/devfreq/15340000.vic/cur_freq)" >> /home/lapis/lps_records/clocks.log'
+
+ExecStop=/bin/sh -c 'echo tegra_wmark > /sys/class/devfreq/15340000.vic/governor'
+ExecStop=/bin/sh -c '[ -f /var/lib/lps/jetson_clocks_default.conf ] && /usr/bin/jetson_clocks --restore /var/lib/lps/jetson_clocks_default.conf || true'
+ExecStop=/bin/sh -c 'echo "$(date "+%%F %%T") [CLOCKS] fabrika ayari geri yuklendi" >> /home/lapis/lps_records/clocks.log'
+
+[Install]
+WantedBy=multi-user.target
