@@ -150,7 +150,16 @@ def generate_launch_description():
             'tag_topic':    '/tag_detections',
             'image_topic':  '/camera/camera/infra1/image_rect_raw',
             'grid_size':    4,
-            'num_levels':   3,
+            # Piramit seviyesi = izlenebilir MAKSIMUM kayma (her seviye 2 kat).
+            # 3 -> 32 px'e kadar, 4 -> 64 px. Kirilma noktasinin ALTINDA seviye
+            # sayisinin dogruluga etkisi SIFIR (olculdu: 0.3-16 px araliginda
+            # 2/3/4 ayni sonucu veriyor), yani 4 yapmak bedavaya tavan yukseltir.
+            # Gercek ucus kareleriyle dogrulandi (faz korelasyonu hakemligiyle):
+            # lv3'un kacirdigi 16-30 px'lik hareketleri (Q=10 basip veriyi
+            # atiyordu) lv4 dogru olctu (Q=38-62). Hat kamera hizina
+            # yetisemedigi icin kareler atlaniyor, bu da efektif kaymayi
+            # katliyor — pay birakmak sart.
+            'num_levels':   4,
             'ema_alpha':    0.25,
             'debug':        True,   # periyodik loglar kapali
             # Ucus video kaydi: tag koseleri + akis HUD'u overlay'li .avi
