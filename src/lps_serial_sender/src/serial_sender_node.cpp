@@ -38,6 +38,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <ctime>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -143,6 +145,25 @@ public:
                         recorder_->path().c_str(), rec_fps, rec_scale);
         }
 
+        // Ham optik akis CSV logu (analiz icin; EMA ONCESI kare-basi olcum).
+        // Dosya video kaydiyla ayni dizine, ayni zaman damgasiyla duser.
+        if (declare_parameter<bool>("flow_csv", false)) {
+            char stamp[32];
+            const std::time_t now = std::time(nullptr);
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S",
+                          std::localtime(&now));
+            const std::string path = rec_dir + "/flow_" + stamp + ".csv";
+            flow_csv_.open(path);
+            if (flow_csv_) {
+                flow_csv_ << "t_ms,raw_dx,raw_dy,raw_q,ema_dx,ema_dy,ema_q,"
+                             "consist,tex,g50,g90\n";
+                flow_csv_.flush();   // ani kesintide baslik kaybolmasin
+                RCLCPP_INFO(get_logger(), "Ham akis CSV: %s", path.c_str());
+            } else {
+                RCLCPP_ERROR(get_logger(), "Akis CSV acilamadi: %s", path.c_str());
+            }
+        }
+
         serial_fd_ = lps::openSerial(serial_port_, baud_rate_);
 
         tag_sub_ = create_subscription<
@@ -187,6 +208,9 @@ public:
         flow_.reset();   // VPI objeleri thread durduktan sonra yok edilir
 
         recorder_.reset();   // son kareyi yazar, dosyayi kapatir
+
+        // CSV: VPI thread durduktan SONRA kapat (yazan o thread'di)
+        if (flow_csv_.is_open()) flow_csv_.close();
 
         if (serial_fd_ >= 0) ::close(serial_fd_);
     }
@@ -415,6 +439,22 @@ private:
                 of.motionPos.x  = r.dx;
                 of.motionPos.y  = r.dy;
                 of.quality      = r.quality;
+
+                // Ham akis CSV'si — EMA ONCESI kare-basi olcum.
+                // Bu thread'de yazmak guvenli: ofstream tamponlu, satir ~60 bayt,
+                // maliyet mikrosaniye. Yarim saniyede bir flush: ani kesinti
+                // (guc gitmesi / kill) halinde en fazla ~15 satir kaybedilir.
+                if (flow_csv_.is_open()) {
+                    flow_csv_ << of.timestamp << ','
+                              << r.raw_dx << ',' << r.raw_dy << ','
+                              << (unsigned)r.raw_quality << ','
+                              << r.dx << ',' << r.dy << ','
+                              << (unsigned)r.quality << ','
+                              << r.consist << ',' << r.tex_ratio << ','
+                              << (unsigned)r.tex_p50 << ',' << (unsigned)r.tex_p90
+                              << '\n';
+                    if (++csv_lines_ % 15 == 0) flow_csv_.flush();
+                }
 
                 { std::lock_guard<std::mutex> lk(data_mutex_); opticflow_ = of; }
                 flow_consist_dbg_ = r.consist;      // sadece debug logu icin
@@ -725,6 +765,8 @@ private:
 
     /* ucus video kaydi (opsiyonel, record_video param) */
     std::unique_ptr<lps::DebugRecorder> recorder_;
+    std::ofstream flow_csv_;    // ham akis logu (VPI thread'inden yazilir)
+    uint64_t      csv_lines_ = 0;
     std::vector<lps::DebugRecorder::TagOverlay> tag_overlays_;  // data_mutex_
 
     std::chrono::steady_clock::time_point start_time_;

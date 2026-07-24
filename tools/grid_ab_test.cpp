@@ -72,15 +72,28 @@ int main(int argc, char **argv)
     const double blur = argc > 4 ? atof(argv[4]) : 0.0;
     if (blur > 0) printf("On-yumusatma: Gauss sigma=%.2f\n\n", blur);
 
-    const float shifts[] = {0.3f, 1.0f, 3.0f, 8.0f};
+    // 5. arguman: piramit seviye sayisi. 0 verilirse SEVIYE TARAMASI yapilir
+    // (2/3/4/5), aksi halde tek seviyede grid 4/8 kiyasi.
+    const int levels_arg = argc > 5 ? atoi(argv[5]) : 3;
+
+    // Buyuk kaymalar seviye taramasi icin sart: her seviye izlenebilir
+    // maksimum yer degistirmeyi kabaca ikiye katlar, kirilma noktasi orada.
+    const float shifts[] = {0.3f, 1.0f, 3.0f, 8.0f, 16.0f, 32.0f, 64.0f};
     const int grids[] = {4, 8};
 
     printf("%-8s %-6s | %-9s %-9s | %-5s %-7s %-6s\n",
-           "gercek", "grid", "olculen", "HATA", "Q", "consist", "tex");
+           "gercek", levels_arg == 0 ? "SEVIYE" : "grid",
+           "olculen", "HATA", "Q", "consist", "tex");
     printf("---------------------------------------------------------------\n");
 
+    // Seviye taramasi modu: grid sabit 4, num_levels degisir
+    const std::vector<int> sweep = levels_arg == 0
+        ? std::vector<int>{2, 3, 4, 5} : std::vector<int>{levels_arg};
+
     for (float sh : shifts) {
-        for (int grid : grids) {
+        for (int lv : sweep)
+        for (int grid : (levels_arg == 0 ? std::vector<int>{4}
+                                         : std::vector<int>{grids[0], grids[1]})) {
             cv::RNG rng(12345);                 // ayni gurultu ikisinde de
             cv::Mat a = base.clone();
             cv::Mat M = (cv::Mat_<double>(2, 3) << 1, 0, sh, 0, 1, 0);
@@ -96,15 +109,16 @@ int main(int argc, char **argv)
 
             try {
                 // ema_alpha=1.0: yumusatma yok, tek adimda tam deger
-                lps::OpticalFlowVPI flow(grid, 3, 1.0f, 8.0f);
+                lps::OpticalFlowVPI flow(grid, lv, 1.0f, 8.0f);
                 flow.init(a);
                 lps::OpticalFlowVPI::Result r;
                 flow.process(b, r);
                 printf("%-8.1f %-6d | %-9.3f %-9.3f | %-5u %-7.2f %-6.2f\n",
-                       sh, grid, r.dx, r.dx - sh, r.quality, r.consist,
-                       r.tex_ratio);
+                       sh, levels_arg == 0 ? lv : grid, r.dx, r.dx - sh,
+                       r.quality, r.consist, r.tex_ratio);
             } catch (const std::exception &e) {
-                printf("%-8.1f %-6d | HATA: %s\n", sh, grid, e.what());
+                printf("%-8.1f %-6d | HATA: %s\n", sh,
+                       levels_arg == 0 ? lv : grid, e.what());
             }
         }
         printf("\n");

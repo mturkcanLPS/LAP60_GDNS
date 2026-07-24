@@ -156,6 +156,9 @@ def generate_launch_description():
             # Ucus video kaydi: tag koseleri + akis HUD'u overlay'li .avi
             # (ucus sonrasi analiz icin). Kapatmak icin False.
             'record_video': True,
+            # Ham optik akis CSV'si (EMA ONCESI kare-basi olcum) — analiz icin.
+            # record_dir'e flow_YYYYmmdd_HHMMSS.csv olarak duser.
+            'flow_csv':     True,
             'record_dir':   '/home/lapis/lps_records',
             'record_fps':   15.0,
             'record_scale': 0.5,

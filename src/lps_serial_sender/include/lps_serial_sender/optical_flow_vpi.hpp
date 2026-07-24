@@ -33,6 +33,11 @@ public:
         float   dx      = 0.0f;   // EMA'li global hareket (px, giris cozunurlugunde)
         float   dy      = 0.0f;
         uint8_t quality = 0;      // 0-100, EMA'li: dokulu hucre uyumu x kapsama
+        // HAM (EMA ONCESI) o karenin kendi olcumu — zamansal yumusatma yok.
+        // Gurultu/gecikme analizi icin: EMA gercek dalgalanmayi gizler.
+        float   raw_dx  = 0.0f;
+        float   raw_dy  = 0.0f;
+        uint8_t raw_quality = 0;
         float   consist   = 0.0f; // debug: dokulu hucrelerin yumusak uyum skoru 0-1
         float   tex_ratio = 0.0f; // debug: dokulu (olculebilir) hucre orani 0-1
         uint8_t tex_p50   = 0;    // debug: hucre gradyan medyani (≈gurultu tabani)
@@ -277,6 +282,11 @@ public:
             gdxdy = cv::Vec2f((float)m[0], (float)m[1]);
             quality = QUALITY_UNRELIABLE;
         }
+        // HAM degerler: EMA'dan gecmeden, o karenin kendi olcumu
+        out.raw_dx      = gdxdy[0];
+        out.raw_dy      = gdxdy[1];
+        out.raw_quality = quality;
+
         ema_ = (1.0f - ema_alpha_) * ema_ + ema_alpha_ * gdxdy;
         // Quality de EMA'lanir: frame basi istatistik gurultulu (sabit
         // sahnede ±15 zipliyordu), otopilot agirlik olarak kullanacagi
