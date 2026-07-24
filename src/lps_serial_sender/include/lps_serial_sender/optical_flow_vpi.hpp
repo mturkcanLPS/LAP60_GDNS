@@ -98,6 +98,11 @@ public:
     OpticalFlowVPI &operator=(const OpticalFlowVPI &) = delete;
 
     bool initialized() const { return initialized_; }
+
+    /** Sadece OLCUM/AYAR icin — uretimde varsayilanlar kullanilir.
+     *  init()'ten once cagrilmali. */
+    void setTuning(float sample_step, double ransac_thresh)
+    { sample_step_ = sample_step; ransac_thresh_ = ransac_thresh; }
     int  paddedWidth()  const { return vpi_w_; }
     int  paddedHeight() const { return vpi_h_; }
 
@@ -265,7 +270,8 @@ public:
         float consist = 0.0f, tex_ratio = 0.0f;
         uint8_t quality;
         if (estimateGlobalDxDy(flowMat, gdxdy, texMap, tex_thresh_eff,
-                               &consist, &tex_ratio)) {
+                               &consist, &tex_ratio,
+                               sample_step_, ransac_thresh_)) {
             // Kapsama cezasi: dokulu hucre orani cok dusukse (gece, dumduz
             // sahne) "herkes ayni fikirde" onemsiz sekilde dogru olabilir —
             // az taniga yuksek guven verilmez. %25 kapsamaya kadar lineer
@@ -461,6 +467,11 @@ private:
     float ema_alpha_;
     float texture_thresh_;
     float prefilter_sigma_;
+    // Olcum icin disari acildi; VARSAYILANLAR ESKI DAVRANISLA BIREBIR AYNI
+    // (estimateGlobalDxDy imzasindaki degerlerle esit) — tek basina
+    // hicbir seyi degistirmez, sadece A/B olcumunu mumkun kilar.
+    float sample_step_   = 6.0f;
+    double ransac_thresh_ = 3.0;
     cv::Mat filtered_;      // on-suzulmus kopya (cagiranin karesi korunur)
     bool  initialized_ = false;
     int   vpi_w_ = 0, vpi_h_ = 0;
