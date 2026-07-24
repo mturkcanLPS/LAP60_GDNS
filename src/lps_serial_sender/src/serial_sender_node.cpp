@@ -117,8 +117,16 @@ public:
         // debug=true iken [OPTFLOW] logundaki thr= ile izlenir.
         float flow_tex = (float)declare_parameter<double>("flow_texture_thresh", 8.0);
 
+        // Akis girisine uygulanan gurultu on-suzmesi (0 = kapali).
+        // OFA korelasyon tabanli; piksel gurultusu dogrudan eslesmeyi bozuyordu.
+        // Olculen kazanc (bkz. optical_flow_vpi.hpp): calisma noktasinda
+        // ortalama hata 0.109 -> 0.033 px, Q 44-55 -> 84-93.
+        // Sahada suphelenirsen 0.0 vererek tek parametreyle geri al.
+        float flow_pre = (float)declare_parameter<double>("flow_prefilter_sigma", 1.5);
+
         flow_ = std::make_unique<lps::OpticalFlowVPI>(grid_size, num_levels,
-                                                      ema_alpha, flow_tex);
+                                                      ema_alpha, flow_tex,
+                                                      flow_pre);
 
         // Ucus kaydi: overlay'li video (tag koseler + akis HUD'u), ayri
         // dusuk oncelikli thread'de — ucus sonrasi "tespit nerede/neden
@@ -369,7 +377,7 @@ private:
 
     /* -------------------------------------------------------------- */
     /* VPI thread — frame kuyrugundan al, optical flow hesapla         */
-    /* Tum govde try/catch icinde: VPI hatasi node'u COKERTMEZ         */
+    /*                                                                 */
     /* -------------------------------------------------------------- */
     void vpiThread()
     {

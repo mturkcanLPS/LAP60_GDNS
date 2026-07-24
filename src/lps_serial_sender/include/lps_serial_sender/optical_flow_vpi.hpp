@@ -46,10 +46,31 @@ public:
      *  betonda ~4-7, gunduz ~10+). Sabit esik (12) aksam ucusunda gercek
      *  zemin dokusunu (derz/leke, 6-12 bandi) OLU sayip quality'yi eziyordu
      *  (26_07_13_T5). Taban 8 = kapkara/dejenere sahnede alt koruma. */
+    /** prefilter_sigma: OFA'ya ve doku haritasina girmeden ONCE uygulanan
+     *  Gauss yumusatmasi (0 = kapali). OFA bir korelasyon algoritmasi;
+     *  piksel gurultusu dogrudan korelasyon yuzeyini bozar. Klasik optik
+     *  akis uygulamalari girisi ON-SUZER, biz suzmuyorduk.
+     *
+     *  26_07_24 olcumu (gercek ucus karesi, bilinen kaydirma, tools/
+     *  grid_ab_test.cpp) — ortalama mutlak hata:
+     *      gurultu     suzgecsiz    sigma=1.5     kazanc
+     *      sigma=0     0.071 px     0.011 px      6.5x
+     *      sigma=2     0.109 px     0.033 px      3.3x   <- olculen calisma noktasi
+     *      sigma=6     0.369 px     0.127 px      2.9x   (los/yuksek gain)
+     *  Yan etki de olumlu: sigma=2'de tex 0.16->0.28, consist 0.70->0.94,
+     *  Q 44-55 -> 84-93 (dogruluk artarken guven metrigi de dogru raporluyor).
+     *
+     *  ONCE DENENEN VE ELENEN: grid_size 4->8 (hucre basina 4 kat piksel).
+     *  Hucre ici gurultuyu azaltiyor ama vektor sayisini da dorde boluyor
+     *  (1620 -> 390 ornek); RANSAC'in cok ornek uzerinden yaptigi ortalama
+     *  daha guclu cikti — sigma=6'da hata 0.369'dan 0.689'a CIKTI. Grid 4 kaldi.
+     *
+     *  Cagiranin karesi DEGISMEZ (kopya uzerinde calisilir): video kaydi
+     *  orijinali gorur, AprilTag zaten ayri node'da kendi aboneligiyle calisir. */
     OpticalFlowVPI(int grid_size, int num_levels, float ema_alpha,
-                   float texture_thresh = 8.0f)
+                   float texture_thresh = 8.0f, float prefilter_sigma = 1.5f)
         : grid_size_(grid_size), num_levels_(num_levels), ema_alpha_(ema_alpha),
-          texture_thresh_(texture_thresh) {}
+          texture_thresh_(texture_thresh), prefilter_sigma_(prefilter_sigma) {}
 
     ~OpticalFlowVPI()
     {
@@ -112,10 +133,14 @@ public:
         check(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16_BL, 0, &img_mv_bl_), "img_mv_bl");
         check(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16,    0, &img_mv_pl_), "img_mv_pl");
 
+        // On-suzme ILK karede de uygulanmali: prev/cur ayni islemden gecmezse
+        // aralarinda sahte bir "keskinlik farki" olusur ve ilk akis bozulur.
+        const cv::Mat &src = prefilter(frame);
+
         // Ilk frame'den prev pyramid — wrapper gecici, sync sonrasi hemen yok edilir
         // (dangling wrapper birakmamak icin; frame Mat'i cagirandan sonra olebilir)
         VPIImage img_first = nullptr;
-        check(vpiImageCreateWrapperOpenCVMat(frame, 0, &img_first), "wrap first frame");
+        check(vpiImageCreateWrapperOpenCVMat(src, 0, &img_first), "wrap first frame");
         try {
             check(vpiSubmitRescale(vpi_stream_, VPI_BACKEND_CUDA,
                 img_first, img_prev_pl_, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0), "init rescale");
@@ -133,7 +158,7 @@ public:
         vpiImageDestroy(img_first);
 
         // Sonraki frame'ler icin kalici wrapper (SetWrapped ile yeniden baglanir)
-        check(vpiImageCreateWrapperOpenCVMat(frame, 0, &img_cur_load_), "wrap cur");
+        check(vpiImageCreateWrapperOpenCVMat(src, 0, &img_cur_load_), "wrap cur");
 
         initialized_ = true;
     }
@@ -143,7 +168,10 @@ public:
      *  VPI hatasinda std::runtime_error firlatir. */
     bool process(const cv::Mat &frame, Result &out)
     {
-        check(vpiImageSetWrappedOpenCVMat(img_cur_load_, frame), "SetWrapped");
+        // On-suzme: akis VE doku haritasi ayni suzulmus kareyi gorur
+        // (init'teki prev pyramid de ayni islemden gecti).
+        const cv::Mat &src = prefilter(frame);
+        check(vpiImageSetWrappedOpenCVMat(img_cur_load_, src), "SetWrapped");
         check(vpiSubmitRescale(vpi_stream_, VPI_BACKEND_CUDA,
             img_cur_load_, img_cur_pl_, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0), "rescale");
         check(vpiSubmitConvertImageFormat(vpi_stream_, VPI_BACKEND_CUDA,
@@ -180,9 +208,9 @@ public:
         // sokulunca gercek hareketi sifira ceker (gunesli ucuslarda
         // olculdu: %17-41 saturasyon "hareket yok" cogunlugu kuruyordu).
         cv::Mat texMap;
-        if (frame.type() == CV_8UC1) {
+        if (src.type() == CV_8UC1) {
             cv::Mat gx, gy;
-            cv::spatialGradient(frame, gx, gy);        // CV_16S ciftler
+            cv::spatialGradient(src, gx, gy);          // CV_16S ciftler
             cv::Mat mag = cv::abs(gx) + cv::abs(gy);
             cv::Mat mag8;
             mag.convertTo(mag8, CV_8U);   // >255 doyar; esik ~30, onemsiz
@@ -272,6 +300,16 @@ private:
     // Bu orandan az dokulu hucre varsa quality lineer cezalanir —
     // 3-5 hucrelik "azinlik konsensusu"ne tam guven verilmesin diye.
     static constexpr float   kFullCoverageRatio = 0.25f;
+
+    /** Girisi akis/doku hesabina hazirlar (gurultu on-suzmesi).
+     *  Kapaliysa cagiranin Mat'ini oldugu gibi dondurur — kopya maliyeti yok.
+     *  Aciksa KOPYA uzerinde calisir; cagiranin karesine dokunulmaz. */
+    const cv::Mat &prefilter(const cv::Mat &frame)
+    {
+        if (prefilter_sigma_ <= 0.0f) return frame;
+        cv::GaussianBlur(frame, filtered_, cv::Size(0, 0), prefilter_sigma_);
+        return filtered_;
+    }
 
     static void check(VPIStatus s, const char *what)
     {
@@ -412,6 +450,8 @@ private:
     int   num_levels_;
     float ema_alpha_;
     float texture_thresh_;
+    float prefilter_sigma_;
+    cv::Mat filtered_;      // on-suzulmus kopya (cagiranin karesi korunur)
     bool  initialized_ = false;
     int   vpi_w_ = 0, vpi_h_ = 0;
     cv::Vec2f ema_{0, 0};
