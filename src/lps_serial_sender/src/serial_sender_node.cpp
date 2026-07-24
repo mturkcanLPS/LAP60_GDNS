@@ -117,7 +117,11 @@ public:
         // Doku kapisi TABANI. Efektif esik sahneye uyarlanir:
         //   esik = max(taban, 1.5 x grad_p50)   (p50 = anlik gurultu tabani)
         // debug=true iken [OPTFLOW] logundaki thr= ile izlenir.
-        float flow_tex = (float)declare_parameter<double>("flow_texture_thresh", 8.0);
+        // Taban 8 -> 4 (26_07_24): on-suzme sonrasi gradyanlar dustu, taban
+        // baglayici hale gelip kapsamayi ve Q'yu eziyordu (beton ucusunda
+        // g90=6 < taban 8). Dokulu sahnede etkisiz, gurultulu sahnede
+        // uyarlanir kural koruyor. Ayrinti: optical_flow_vpi.hpp
+        float flow_tex = (float)declare_parameter<double>("flow_texture_thresh", 4.0);
 
         // Akis girisine uygulanan gurultu on-suzmesi (0 = kapali).
         // OFA korelasyon tabanli; piksel gurultusu dogrudan eslesmeyi bozuyordu.

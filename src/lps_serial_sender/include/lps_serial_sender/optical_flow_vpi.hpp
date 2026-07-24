@@ -50,7 +50,22 @@ public:
      *  gradyani = o anki gurultu tabani (isik/gain ile degisir: aksam los
      *  betonda ~4-7, gunduz ~10+). Sabit esik (12) aksam ucusunda gercek
      *  zemin dokusunu (derz/leke, 6-12 bandi) OLU sayip quality'yi eziyordu
-     *  (26_07_13_T5). Taban 8 = kapkara/dejenere sahnede alt koruma. */
+     *  (26_07_13_T5).
+     *
+     *  TABAN 8 -> 4 (26_07_24): on-suzme gradyanlari dusurunce taban
+     *  BAGLAYICI hale geldi. 24_07 beton ucusunda g50=3, g90=6 olculdu —
+     *  sahnenin en dokulu %10'u bile 8'in altinda kaldi; kapsama (tex 0.06)
+     *  ve onunla birlikte Q (medyan 14) coktu. AYNI yuzeydeki 21_07
+     *  ucusunda (suzgec yok) g50=8/g90=16, tex 0.25, Q 31 idi.
+     *  Hakemli olcum (cv::phaseCorrelate, bizim hattan bagimsiz) tabanin
+     *  DOGRULUGU degistirmedigini gosterdi (hata 0.92-1.23 px, farklar
+     *  gurultu icinde); degisen sey yalnizca raporlanan guven. Taban 4 ile
+     *  kapsama geri geliyor (tex 0.12-0.29), Q daha bilgilendirici oluyor.
+     *  DOKULU sahnede taban tamamen ETKISIZ: orada uyarlanir kural
+     *  (1.5 x p50) zaten daha yuksek — 8/6/4/3/2 hepsi ayni sonucu verdi.
+     *  Gurultulu sahnede de koruma surer: gurultu p50'yi yukseltir, esik
+     *  onunla birlikte tabanin uzerine cikar. Taban artik yalnizca
+     *  "temiz ama dokusuz" sahnede baglayici — hedeflenen durum tam bu. */
     /** prefilter_sigma: OFA'ya ve doku haritasina girmeden ONCE uygulanan
      *  Gauss yumusatmasi (0 = kapali). OFA bir korelasyon algoritmasi;
      *  piksel gurultusu dogrudan korelasyon yuzeyini bozar. Klasik optik
@@ -73,7 +88,7 @@ public:
      *  Cagiranin karesi DEGISMEZ (kopya uzerinde calisilir): video kaydi
      *  orijinali gorur, AprilTag zaten ayri node'da kendi aboneligiyle calisir. */
     OpticalFlowVPI(int grid_size, int num_levels, float ema_alpha,
-                   float texture_thresh = 8.0f, float prefilter_sigma = 1.5f)
+                   float texture_thresh = 4.0f, float prefilter_sigma = 1.5f)
         : grid_size_(grid_size), num_levels_(num_levels), ema_alpha_(ema_alpha),
           texture_thresh_(texture_thresh), prefilter_sigma_(prefilter_sigma) {}
 
