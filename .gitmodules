@@ -1,0 +1,3 @@
+[submodule "src/negotiated"]
+	path = src/negotiated
+	url = https://github.com/osrf/negotiated.git

@@ -1,0 +1,33 @@
+# car_detector (LPS) — YOLOv8n VisDrone (10 sinif) nvinfer config'i.
+# DeepStream-Yolo config_infer_primary_yoloV8.txt sablonundan; degisenler:
+#   onnx/labels/engine bu dizinde, FP16 (network-mode=2), 10 sinif, custom-lib MUTLAK yol.
+# Model: test_visdrone_best.pt (ultralytics 8.0.71, imgsz 640) ->
+#   DeepStream-Yolo/utils/export_yoloV8.py -s 640 --simplify  (28_09, opset 18)
+#   ONNX = PyTorch dogrulandi: kutu farki <=0.002 px, skor farki <=6e-7.
+# Motor: ilk acilista TensorRT bu dizine 'model_b1_gpu0_fp16.engine' yazar (car_detector
+# config dizinine chdir eder), sonraki acilislar onu yukler. Model degisirse SIL.
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=test_visdrone_best.onnx
+model-engine-file=model_b1_gpu0_fp16.engine
+labelfile-path=labels.txt
+batch-size=1
+network-mode=2
+num-detected-classes=10
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+symmetric-padding=1
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/home/lapis/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+engine-create-func-name=NvDsInferYoloCudaEngineGet
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.25
+topk=300

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  LPS FastDDS profili: kamera karelerini (1280x720 mono8 = 921 KB) PAYLASIMLI
+  BELLEKTEN tasi.
+
+  Neden: FastDDS varsayilan SHM segmenti ~512 KB -> 921 KB'lik kare sigmaz, UDP
+  loopback'e duser, ~15 parcaya bolunur. Linux UDP alim tamponu varsayilan
+  208 KB (net.core.rmem_max) — tek kareyi bile tutamaz; alici thread bir an
+  gecikince parca duser ve TUM kare kaybolur. 28_09 olcumu: aciliştan beri
+  UDP datagramlarinin %17.8'i RcvbufErrors ile dusmus; serial_sender 30 Hz
+  kameradan ~21-24 Hz alabiliyordu (22_09'dan beri), kareler duzensiz atlaniyordu.
+
+  segment_size: her yayincinin SHM segmenti; icinde gonderimde olan ornekler
+  durur (realsense infra1 + infra2 x 921 KB, birkac kare derinlik). 32 MB bol pay.
+  UDPv4 de acik birakildi: ros2 CLI araclari ve bu profili kullanmayan surecler
+  (farkli kullanici vb.) yine konusabilsin.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>lps_shm</transport_id>
+      <type>SHM</type>
+      <segment_size>33554432</segment_size>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>lps_udp</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="lps_default_participant" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports>
+        <transport_id>lps_shm</transport_id>
+        <transport_id>lps_udp</transport_id>
+      </userTransports>
+    </rtps>
+  </participant>
+</profiles>

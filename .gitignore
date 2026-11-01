@@ -1,0 +1,10 @@
+# colcon ciktilari (ust duzey ve paket icindeki eski kalintilar)
+build/
+install/
+log/
+/colcon
+
+# python / editor
+__pycache__/
+*.pyc
+.*.sw[a-p]

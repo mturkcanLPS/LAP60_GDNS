@@ -1,0 +1,46 @@
+1 ) 
+// Realsense 
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash 
+
+ros2 launch realsense2_camera rs_launch.py
+
+2)
+//apriltag
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash 
+
+ros2 launch lps_apriltag_test_launch apriltag_realsense_test.launch.py   image_topic:=/camera/camera/color/image_raw   camera_info_topic:=/camera/camera/color/camera_info   tag_family:=tag36h11   tag_size:=0.08
+
+3)
+//udp publish
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash 
+
+ros2 run lps_apriltag_udp apriltag_udp_sender
+
+---------------------------------------------
+BUILD 
+
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+
+rm -rf build/lps_apriltag_udp install/lps_apriltag_udp log
+colcon build --symlink-install --packages-select lps_apriltag_udp
+source install/setup.bash
+
+build -> colcon build --symlink-install --packages-select lps_apriltag_test_launch
+build -> colcon build --symlink-install --packages-select lps_bringup
+
+-------------------------
+BRINGUP LAUNCH //
+build -> colcon build --symlink-install --packages-select lps_bringup
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash 
+
+ros2 launch lps_bringup bringup.launch.py
+

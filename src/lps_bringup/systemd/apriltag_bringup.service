@@ -1,0 +1,20 @@
+[Unit]
+Description=LAPIS ROS2 Bringup Service (RealSense + AprilTag + UDP Publisher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/lapis
+
+ExecStart=/bin/bash -lc 'source /home/lapis/ros2_ws/install/setup.bash && ros2 launch lps_bringup bringup.launch.py'
+
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
