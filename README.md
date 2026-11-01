@@ -17,14 +17,14 @@ Her şey tek bir systemd servisiyle (`apriltag_bringup`) açılışta başlar.
 | CUDA / DeepStream / VPI | 12.6 / 7.1 / 3.2 |
 | ROS 2 | Humble |
 | ROS paketleri (apt) | `ros-humble-realsense2-camera`, `ros-humble-isaac-ros-apriltag` (+ `-interfaces`, `-image-proc`) 3.1 |
-| Kütüphaneler (apt) | `libapriltag-dev` 3.2, `libopencv-dev` |
+| Kütüphaneler (apt) | `libapriltag-dev` 3.2, `libopencv-dev`, `nvidia-l4t-kernel-headers` (CH340 sürücüsü için) |
 
 Bağlantılar:
 
 | Ne | Port |
 |---|---|
 | Otopilot | `/dev/ttyTHS1`, 115200 baud |
-| HRVS radar | CH340 USB-seri → `/dev/ttyCH340` (udev kuralı), 921600 baud |
+| HRVS radar | CH340 USB-seri → `/dev/ttyCH340` (udev kuralı), 921600 baud. **Stok JetPack'te sürücüsü yok**, kurulumda derlenir. |
 | HRVS reset/tetik | GPIO PH.07 (gpiochip0, hat 50) |
 | RealSense | USB 3 |
 
@@ -48,11 +48,15 @@ src/car_detector/scripts/install_models.sh
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 
-# 4) udev kuralı (/dev/ttyCH340 bağlantısı)
+# 4) CH340 sürücüsü (ch341.ko): NVIDIA kernel'inde kapalı, olmazsa radar portu oluşmaz.
+#    Kernel header'larıyla derler, sudo ile kurar. Zaten kuruluysa dokunmaz.
+src/lps_bringup/drivers/ch341/install_ch341.sh
+
+# 5) udev kuralı (/dev/ttyCH340 bağlantısı)
 sudo cp src/lps_bringup/udev/99-usb-serial.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 
-# 5) systemd servisi + drop-in'ler
+# 6) systemd servisi + drop-in'ler
 sudo cp src/lps_bringup/systemd/apriltag_bringup.service /etc/systemd/system/
 sudo mkdir -p /etc/systemd/system/apriltag_bringup.service.d
 sudo cp src/lps_bringup/systemd/{robust,dds_yerel,clocks}.conf \
@@ -60,6 +64,8 @@ sudo cp src/lps_bringup/systemd/{robust,dds_yerel,clocks}.conf \
 sudo systemctl daemon-reload
 sudo systemctl enable --now apriltag_bringup.service
 ```
+
+**JetPack/kernel güncellemesi:** Kernel sürümü (`uname -r`) değişirse CH340 sürücüsü yeni sürümde olmaz ve radar gelmez. Güncellemeden sonra `install_ch341.sh` tekrar çalıştırılır. 36.4.x içindeki güncellemelerde sürüm aynı kaldığı için sürücü korunur.
 
 **İlk açılış:** Seçili modelin TensorRT motoru oluşturulurken (~6 dk) araç tespiti çalışmaz. Diğer her şey çalışır. Motor model klasörüne yazılır, sonraki açılışlarda 1 sn'de yüklenir. Motorlar TensorRT sürümüne ve GPU'ya özel olduğu için repoda yoktur.
 
@@ -83,7 +89,7 @@ Drop-in'lerin görevi:
 |---|---|
 | `lps_serial_sender` | `serial_sender_node`: otopilot paketi, HRVS radar, AprilTag füzyonu, optik akış, IR üçgen, sağlık mesajı. `cpu_apriltag_node`: libapriltag ile CPU AprilTag (infra1 ve infra2 için iki kopya). `infra2_recorder_node`: infra2 optik akış + video kaydı. HRVS SDK `third_party/hrvs_sdk` altında. |
 | `car_detector` | DeepStream YOLOv8n VisDrone + NvDCF tek araç kilidi → `/car_detection/bearing`. Modeller `models/`, nvinfer config `config/`. |
-| `lps_bringup` | `bringup.launch.py` (tüm yığın), systemd ve udev dosyaları, izleme betikleri |
+| `lps_bringup` | `bringup.launch.py` (tüm yığın), systemd ve udev dosyaları, CH340 sürücüsü (`drivers/ch341`), izleme betikleri |
 | `vpi_optical_flow`, `lps_apriltag_udp`, `lps_apriltag_test_launch` | Erken dönem test araçları; bringup kullanmıyor |
 | `negotiated` | osrf/negotiated, alt modül |
 
