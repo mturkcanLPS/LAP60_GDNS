@@ -1,0 +1,110 @@
+#---------------------------------------------------------------------------------------
+# executables, which can be created by this makefile 		
+EXE := example.out
+EXE_NOSTD := example_nostd.out
+EXE_DEBUG := example_debug.out
+EXE_VELBODY := example_velbody.out
+EXE_CONFIG := example_config.out
+
+#---------------------------------------------------------------------------------------
+# important directories
+BIN_DIR := bin
+BUILD_DIR := build
+HRVS_SDK_PATH := ../../radar_system
+HRVS_LIB := $(HRVS_SDK_PATH)/lib
+HRVS_INCLUDE := $(HRVS_SDK_PATH)/include
+PAL_SRC := $(HRVS_SDK_PATH)/src/pal
+
+#---------------------------------------------------------------------------------------
+# programs needed for building the targets
+
+ifeq ($(TARGET), 64bit)
+    TOOL_PREFIX := aarch64-linux-gnu-
+	HRVS_SDK_LIB_STD := hrvs_sdk_arm64.a
+	HRVS_SDK_LIB_NOSTD := hrvs_sdk_arm64_nostd.a
+else
+	TOOL_PREFIX := arm-linux-gnueabihf-
+	HRVS_SDK_LIB_STD := hrvs_sdk_arm.a
+	HRVS_SDK_LIB_NOSTD := hrvs_sdk_arm_nostd.a
+endif
+
+CXX := $(TOOL_PREFIX)g++
+LD := $(TOOL_PREFIX)g++
+LDLIBS_GPIOD := -lgpiod
+
+#---------------------------------------------------------------------------------------
+# flags
+CXXFLAGS := -Wall -Wextra -Wno-unused-parameter -Wno-unused-but-set-variable -Wno-unused-function -Wno-reorder -O2
+
+# nostd app definitions
+NOSTD_DEFINITIONS += -D NO_INFO -D BYTE_BUFFER_AVOID_TEMPLATE_CHECKS
+
+# std / debug app definitions
+DEFINITIONS += -D MSG_LOGGING
+
+#---------------------------------------------------------------------------------------
+# targets
+
+all: build_dirs $(BIN_DIR)/$(EXE) $(BIN_DIR)/$(EXE_NOSTD) $(BIN_DIR)/$(EXE_DEBUG) $(BIN_DIR)/$(EXE_VELBODY) $(BIN_DIR)/$(EXE_CONFIG)
+
+$(BIN_DIR)/$(EXE): $(BUILD_DIR)/example.o $(BUILD_DIR)/gpio_pin_linux.o $(BUILD_DIR)/uart_linux.o $(BUILD_DIR)/thread_stdlib.o $(BUILD_DIR)/time_stdlib.o
+	@echo Linking $(EXE)
+	$(LD) $(CXXFLAGS) -std=c++11 -pthread -o $@  $^ -L $(HRVS_LIB) -l:$(HRVS_SDK_LIB_STD) $(LDLIBS_GPIOD)
+
+$(BIN_DIR)/$(EXE_NOSTD): $(BUILD_DIR)/example_nostd.o $(BUILD_DIR)/gpio_pin_linux.o $(BUILD_DIR)/uart_linux.o $(BUILD_DIR)/thread_linux.o $(BUILD_DIR)/time_linux.o
+	@echo Linking $(EXE_NOSTD)
+	$(LD) $(CXXFLAGS) -o $@  $^ -L $(HRVS_LIB) -l:$(HRVS_SDK_LIB_NOSTD) $(LDLIBS_GPIOD)
+
+$(BIN_DIR)/$(EXE_DEBUG): $(BUILD_DIR)/example_debug.o $(BUILD_DIR)/gpio_pin_linux.o $(BUILD_DIR)/uart_linux.o $(BUILD_DIR)/thread_stdlib.o $(BUILD_DIR)/time_stdlib.o
+	@echo Linking $(EXE_DEBUG)
+	$(LD) $(CXXFLAGS) -std=c++11 -pthread -o $@  $^ -L $(HRVS_LIB) -l:$(HRVS_SDK_LIB_STD) $(LDLIBS_GPIOD)
+
+$(BIN_DIR)/$(EXE_VELBODY): $(BUILD_DIR)/example_velbody.o $(BUILD_DIR)/gpio_pin_linux.o $(BUILD_DIR)/uart_linux.o $(BUILD_DIR)/thread_stdlib.o $(BUILD_DIR)/time_stdlib.o
+	@echo Linking $(EXE_VELBODY)
+	$(LD) $(CXXFLAGS) -std=c++11 -pthread -o $@  $^ -L $(HRVS_LIB) -l:$(HRVS_SDK_LIB_STD) $(LDLIBS_GPIOD)
+
+$(BIN_DIR)/$(EXE_CONFIG): $(BUILD_DIR)/example_config.o $(BUILD_DIR)/gpio_pin_linux.o $(BUILD_DIR)/uart_linux.o $(BUILD_DIR)/thread_stdlib.o $(BUILD_DIR)/time_stdlib.o
+	@echo Linking $(EXE_CONFIG)
+	$(LD) $(CXXFLAGS) -std=c++11 -pthread -o $@  $^ -L $(HRVS_LIB) -l:$(HRVS_SDK_LIB_STD) $(LDLIBS_GPIOD)
+
+
+$(BUILD_DIR)/uart_linux.o: $(PAL_SRC)/uart_linux.cpp
+	$(CXX) $(CXXFLAGS) -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/gpio_pin_linux.o: $(PAL_SRC)/gpio_pin_linux.cpp
+	$(CXX) $(CXXFLAGS) -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/thread_stdlib.o: $(PAL_SRC)/thread_stdlib.cpp
+	$(CXX) $(CXXFLAGS) -std=c++11 -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/time_stdlib.o: $(PAL_SRC)/time_stdlib.cpp
+	$(CXX) $(CXXFLAGS) -std=c++11 -I $(HRVS_INCLUDE) -c $< -o $@
+    
+$(BUILD_DIR)/thread_linux.o: $(PAL_SRC)/thread_linux.cpp
+	$(CXX) $(CXXFLAGS) -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/time_linux.o: $(PAL_SRC)/time_linux.cpp
+	$(CXX) $(CXXFLAGS) -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/example.o: src/example.cpp
+	$(CXX) $(CXXFLAGS) $(DEFINITIONS) -std=c++11 -I $(HRVS_INCLUDE) -c $< -o $@
+    
+$(BUILD_DIR)/example_nostd.o: src/example_nostd.cpp
+	$(CXX) $(CXXFLAGS) $(NOSTD_DEFINITIONS) -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/example_debug.o: src/example_debug.cpp
+	$(CXX) $(CXXFLAGS) $(DEFINITIONS) -std=c++11 -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/example_velbody.o: src/example_velbody.cpp
+	$(CXX) $(CXXFLAGS) $(DEFINITIONS) -std=c++11 -I $(HRVS_INCLUDE) -c $< -o $@
+
+$(BUILD_DIR)/example_config.o: src/example_config.cpp
+	$(CXX) $(CXXFLAGS) $(DEFINITIONS) -std=c++11 -I $(HRVS_INCLUDE) -c $< -o $@
+
+build_dirs:
+	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(BIN_DIR)
+
+clean:
+	rm -rf $(BUILD_DIR)  
+	rm -rf $(BIN_DIR)

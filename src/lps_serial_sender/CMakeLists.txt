@@ -14,7 +14,7 @@ find_package(OpenCV REQUIRED)
 find_package(vpi 3.2 REQUIRED)
 
 # --- HRVS SDK ---
-set(HRVS_SDK_ROOT /home/lapis/Desktop/GDNS/hrvs_sdk/radar_system)
+set(HRVS_SDK_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/hrvs_sdk/radar_system)
 set(HRVS_SDK_LIB  ${HRVS_SDK_ROOT}/lib/hrvs_sdk_arm64.a)
 set(HRVS_PAL_SRCS
     ${HRVS_SDK_ROOT}/src/pal/uart_linux.cpp
