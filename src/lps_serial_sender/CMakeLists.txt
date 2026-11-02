@@ -109,4 +109,11 @@ target_include_directories(test_ir_triangle PRIVATE
 target_link_libraries(test_ir_triangle ${OpenCV_LIBS})
 install(TARGETS test_ir_triangle DESTINATION lib/${PROJECT_NAME})
 
+# --- Otopilot RX ayristirici testi (0x49 KAPAT; donanimsiz calisir) ---
+# Node ile AYNI kodu (include/lps_serial_sender/autopilot_rx.hpp) kullanir.
+# Calistirma: ros2 run lps_serial_sender test_autopilot_rx
+add_executable(test_autopilot_rx test/test_autopilot_rx.cpp)
+target_include_directories(test_autopilot_rx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+install(TARGETS test_autopilot_rx DESTINATION lib/${PROJECT_NAME})
+
 ament_package()

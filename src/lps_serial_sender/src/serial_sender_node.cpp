@@ -42,6 +42,8 @@
 #include "lps_serial_sender/tag_fusion.hpp"       // AprilTag -> avgPos (infra2 ile ORTAK)
 #include "lps_serial_sender/frame_gap_stats.hpp"  // akis kare araligi duzenliligi
 #include "lps_serial_sender/system_health.hpp"    // Jetson sicaklik/yuk/guc -> health alani
+#include "lps_serial_sender/autopilot_rx.hpp"     // otopilot -> Jetson mesajlari (0x49 KAPAT)
+#include <cstdlib>                                // std::system (kapatma komutu)
 
 #include <fstream>
 #include <sstream>
@@ -607,6 +609,12 @@ public:
 
         serial_fd_ = openSerial(serial_port_, baud_rate_);
 
+        // Otopilot -> Jetson: 0x49 KAPAT (yuk 01) gelirse Jetson'i DUZGUN kapat
+        // (servis durur, video/CSV kapanir, sonra poweroff). Servis root calistigi
+        // icin systemctl izin ister/bekler degil. Test: poweroff_command:=<zararsiz komut>.
+        poweroff_enable_ = declare_parameter<bool>("autopilot_poweroff_enable", true);
+        poweroff_cmd_    = declare_parameter<std::string>("poweroff_command", "/usr/bin/systemctl poweroff");
+
         tag_sub_ = create_subscription<
             isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>(
             tag_topic_, rclcpp::SensorDataQoS(),
@@ -640,6 +648,7 @@ public:
         // Serial gonderim: ROS wall timer YERINE ozel RT TX thread (LPS gibi).
         // Executor jitter'indan bagimsiz, mutlak-deadline (sleep_until) sabit periyot.
         tx_thread_ = std::thread(&SerialSenderNode::txThread, this);
+        rx_thread_ = std::thread(&SerialSenderNode::rxThread, this);
 
         vpi_thread_  = std::thread(&SerialSenderNode::vpiThread,  this);
         // hrvs_enabled:=false -> radar thread'i HIC baslamaz (UART/GPIO'ya
@@ -682,6 +691,8 @@ public:
 
         tx_running_ = false;                          // once TX thread dur (serial'i o yaziyor)
         if (tx_thread_.joinable()) tx_thread_.join();
+        rx_running_ = false;                          // RX poll'u en gec 100 ms'de doner
+        if (rx_thread_.joinable()) rx_thread_.join();
 
         vpi_running_ = false;
         frame_cv_.notify_all();
@@ -1236,10 +1247,10 @@ private:
 
             if (debug_) {
                 RCLCPP_INFO(get_logger(),
-                    "[SERIAL]    %.1f Hz | dt: avg=%.2fms min=%.2fms max=%.2fms jitter=%.2fms | pkt=%zuB | frame=%u",
+                    "[SERIAL]    %.1f Hz | dt: avg=%.2fms min=%.2fms max=%.2fms jitter=%.2fms | pkt=%zuB | frame=%u | rx=%uB",
                     serial_hz_, dt_avg_ms, dt_min_ms, dt_max_ms, jitter_ms,
                     sizeof(jetsonOtopilotPack_t),
-                    pkt.pack.variables.hrvs.frameNumber);
+                    pkt.pack.variables.hrvs.frameNumber, rx_bytes_.exchange(0));
 
                 // Tek tek tag pozu artik gonderilmiyor; sadece validity bit'leri.
                 //   duvar valid1-4 = N/E/S/W, kucuk valid5-8 = 10/12/14/16.
@@ -1359,6 +1370,64 @@ private:
             return false;
         }
         return true;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* RX thread - otopilot -> Jetson mesajlari (02_11: 0x49 KAPAT).   */
+    /* Ayni fd'yi TX thread'i yaziyor; okuma/yazma ayri thread'den     */
+    /* tty'de guvenli. Cerceve kurali TX ile ayni (autopilot_rx.hpp).  */
+    /* -------------------------------------------------------------- */
+    void rxThread()
+    {
+        lps::AutopilotRxParser parser(
+            [this](uint8_t id, const std::vector<uint8_t> &p) { onAutopilotMsg(id, p); });
+        uint8_t buf[256];
+        while (rx_running_) {
+            struct pollfd p{serial_fd_, POLLIN, 0};
+            const int r = ::poll(&p, 1, 100);
+            if (r == 0) { parser.idle(); continue; }   // 100 ms sessiz: yarim cerceve gelmeyecek
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "[SERIAL-RX] poll hatasi: %s", strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            const ssize_t n = ::read(serial_fd_, buf, sizeof(buf));
+            if (n > 0) {
+                rx_bytes_ += (uint32_t)n;
+                parser.feed(buf, (size_t)n);
+            } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "[SERIAL-RX] read hatasi: %s", strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+    void onAutopilotMsg(uint8_t id, const std::vector<uint8_t> &p)
+    {
+        if (id != lps::AP_MSG_POWEROFF) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "[SERIAL-RX] otopilot mesaji id=0x%02X %zu B (islenmiyor)", id, p.size());
+            return;
+        }
+        if (p.size() != 1 || p[0] != 1) {
+            RCLCPP_WARN(get_logger(), "[SERIAL-RX] KAPAT mesaji ama yuk %zu B, ilk bayt %d -> yok sayildi",
+                        p.size(), p.empty() ? -1 : (int)p[0]);
+            return;
+        }
+        if (!poweroff_enable_) {
+            RCLCPP_WARN(get_logger(), "[SERIAL-RX] KAPAT geldi ama autopilot_poweroff_enable=false -> yok sayildi");
+            return;
+        }
+        if (poweroff_requested_.exchange(true)) return;   // tekrarlanan KAPAT: komut bir kez
+        RCLCPP_FATAL(get_logger(), "[SERIAL-RX] OTOPILOT KAPAT ISTEDI -> '%s'", poweroff_cmd_.c_str());
+        const int rc = std::system(poweroff_cmd_.c_str());
+        if (rc != 0) {
+            RCLCPP_ERROR(get_logger(), "[SERIAL-RX] kapatma komutu basarisiz (rc=%d), sonraki KAPAT'ta tekrar", rc);
+            poweroff_requested_ = false;
+        }
     }
 
     /* -------------------------------------------------------------- */
@@ -1623,6 +1692,14 @@ private:
     std::thread        tx_thread_;
     std::atomic<bool>  tx_running_{true};
     int                tx_cpu_ = 5;   // -1 = CPU pin kapali
+
+    /* RX thread - otopilot -> Jetson (0x49 KAPAT) */
+    std::thread           rx_thread_;
+    std::atomic<bool>     rx_running_{true};
+    std::atomic<uint32_t> rx_bytes_{0};          // [SERIAL] logunda saniyelik
+    std::atomic<bool>     poweroff_requested_{false};
+    bool                  poweroff_enable_ = true;
+    std::string           poweroff_cmd_;
 
     /* sensor verisi + mutex (spin thread <-> vpi thread) */
     std::mutex      data_mutex_;
