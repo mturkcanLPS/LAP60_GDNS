@@ -465,6 +465,16 @@ public:
         // elemek (radar 10 Hz + bayat oldugu icin sikilastirmak dogru eslesmeleri
         // atmaya baslar). Radar yoksa kontrol tamamen atlanir.
         ir_z_tol_      = (float)declare_parameter<double>("ir_z_tol",      0.50);
+        // Sahte ucgen kurallari (02_11; gece LED testinde yeniden ayarlanacak).
+        // A: <= bu kadar parlak nokta varsa degerlendir (gece 3 LED + birkac lamba).
+        ir_max_blobs_valid_ = declare_parameter<int>("ir_max_blobs_valid", 6);
+        // B: radar yoksa/bayatsa GECERSIZ (eskiden Z kontrolu sessizce atlaniyordu).
+        //    Radarsiz masa testinde ir_require_radar:=false.
+        ir_require_radar_   = declare_parameter<bool>("ir_require_radar", true);
+        ir_radar_stale_ms_  = (uint32_t)declare_parameter<int>("ir_radar_stale_ms", 1500);
+        // D: ayni yerde (kareden kareye <= ir_max_jump_px) en az ir_min_consec kare.
+        ir_min_consec_      = declare_parameter<int>("ir_min_consec", 5);
+        ir_max_jump_px_     = declare_parameter<double>("ir_max_jump_px", 20.0);
         // min_area MENZILI BELIRLER: yukseklik arttikca LED'in piksel izi
         // 1/Z^2 ile kuculur ve tespiti sinirlayan ilk sey genelde esik degil,
         // bu alan tabani olur. 1 px'e indirildi - tek piksel gurultusunu ucgen
@@ -534,7 +544,7 @@ public:
                 // y_at_zopt = nx*z_opt (metrik karsilik, SADECE analiz kolayligi
                 // icin - gonderilmiyor, otopilot kendi Z'siyle carpiyor).
                 ir_csv_ << "t_ms,valid,nx,ny,x_at_zopt,y_at_zopt,z_opt,z_radar,"
-                           "n_blobs,amin,fit,rx,ry,ax,ay,bx,by,mx,my\n";
+                           "n_blobs,amin,fit,rx,ry,ax,ay,bx,by,mx,my,aday,neden,dizi\n";
                 ir_csv_.flush();
                 RCLCPP_INFO(get_logger(), "IR CSV: %s", path.c_str());
             } else {
@@ -869,18 +879,53 @@ private:
             ov.z       = Z_m;
             ov.z_radar = Z_radar;
 
+            const cv::Point2f mid = (ir_pts_[i_a] + ir_pts_[i_b]) * 0.5f;
+            ov.cand   = true;
+            ov.pts[0] = ir_pts_[i_right];
+            ov.pts[1] = ir_pts_[i_a];
+            ov.pts[2] = ir_pts_[i_b];
+            ov.mid    = mid;
 
-            if (Z_radar > 0.05f &&
-                std::fabs(Z_m - Z_radar) / Z_radar > ir_z_tol_) {
+            // Sahte ucgen kurallari (02_11). LED yontemi GECE icin: gunduz sahnesi 16+
+            // parlak nokta uretir, 560 ucluden tesadufi dik ucgen cikar (gunduz
+            // ucuslarinda 4718 sahte gecerli kare). Kayitlarla tekrar oynatma:
+            // A+B+D sahtelerin %99'unu eler. Esikler gece LED testinde ayarlanacak.
+            //   A) kalabalik sahne   B) radar yok/bayat (eskiden kontrol ATLANIYORDU)
+            //   Z) optik Z radarla uyusmuyor   D) konum ardisik karelerde kararsiz
+            const uint32_t now_ms = msSinceStart();
+            const uint32_t rl = hrvs_last_ms_.load();
+            const bool radar_ok = Z_radar > 0.05f && rl != 0 && now_ms - rl <= ir_radar_stale_ms_;
+            const char *red = nullptr;
+            if ((int)ir_pts_.size() > ir_max_blobs_valid_)       red = "kalabalik sahne";
+            else if (ir_require_radar_ && !radar_ok)             red = "radar yok/bayat";
+            else if (Z_radar > 0.05f &&
+                     std::fabs(Z_m - Z_radar) / Z_radar > ir_z_tol_) {
+                red = "Z radarla uyusmuyor";
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
                     "[IR] optik Z=%.2f m radar Z=%.2f m ile uyusmuyor (tol %.0f%%) "
                     "- tespit reddedildi", Z_m, Z_radar, ir_z_tol_ * 100.0f);
-                std::lock_guard<std::mutex> lk(data_mutex_);
-                ir_data_ = ir; ir_overlay_ = ov;   // ir.valid = false
-                return;
             }
+            if (!red) {
+                ir_run_ = (ir_run_ > 0 && cv::norm(mid - ir_last_mid_) <= ir_max_jump_px_)
+                          ? ir_run_ + 1 : 1;
+                ir_last_mid_ = mid;
+                if (ir_run_ < ir_min_consec_) red = "kararsiz";
+            } else {
+                ir_run_ = 0;
+            }
+            ov.run    = ir_run_;
+            ov.reason = red;
 
-            const cv::Point2f mid = (ir_pts_[i_a] + ir_pts_[i_b]) * 0.5f;
+            int amin = INT32_MAX;
+            for (int idx : {i_right, i_a, i_b})
+                if (idx < (int)ir_areas_.size()) amin = std::min(amin, ir_areas_[idx]);
+            ov.min_area = (amin == INT32_MAX) ? 0 : amin;
+        } else {
+            ir_run_ = 0;
+        }
+
+        if (ov.cand && !ov.reason) {
+            const cv::Point2f mid = ov.mid;
 
             std::vector<cv::Point2f> in{mid}, out;
             cv::undistortPoints(in, out, K, D);
@@ -909,19 +954,9 @@ private:
             ir.irpos.x  = out[0].x;
             ir.irpos.y  = out[0].y;
 
-            // Menzil teshisi: eslesen 3 blob'un EN KUCUGUNUN alani. Yukseklik
-            // arttikca LED'in piksel izi kuculur; bu deger ir_min_area'ya
-            // yaklastikca tespit sinirina geliniyor demektir (bkz. ir_min_area).
-            int amin = INT32_MAX;
-            for (int idx : {i_right, i_a, i_b})
-                if (idx < (int)ir_areas_.size()) amin = std::min(amin, ir_areas_[idx]);
-            ov.min_area = (amin == INT32_MAX) ? 0 : amin;
-
+            // ov.min_area (menzil teshisi: eslesen 3 blob'un EN KUCUGU) ve
+            // pts[0]=dik aci kosesi / mid=huni merkezi yukarida aday icin dolduruldu.
             ov.valid   = true;
-            ov.pts[0]  = ir_pts_[i_right];   // dik aci kosesi (ucgen kimligi)
-            ov.pts[1]  = ir_pts_[i_a];
-            ov.pts[2]  = ir_pts_[i_b];
-            ov.mid     = mid;                // huni merkezi - yon BURADAN cikti
             // ov.x/y = pakete giden NORMALIZE yon; ov.z/z_radar pakete gitmez,
             // HUD/CSV'de metrik karsiligi gostermek ve optik-radar menzilini
             // kiyaslamak icin tutulur.
@@ -949,13 +984,16 @@ private:
                 << (ir.irpos.x * ov.z) << ',' << (ir.irpos.y * ov.z) << ','
                 << ov.z << ',' << ov.z_radar << ','
                 << ov.n_blobs << ',' << ov.min_area << ',' << ov.fit_err;
-        if (ov.valid)
+        // Koseler ADAY icin de yazilir (reddedilen dahil); son 3 sutun: aday, red
+        // sebebi (ok = gecerli, bos = ucgen yok), ardisik kararli kare sayisi.
+        if (ov.cand)
             ir_csv_ << ',' << ov.pts[0].x << ',' << ov.pts[0].y
                     << ',' << ov.pts[1].x << ',' << ov.pts[1].y
                     << ',' << ov.pts[2].x << ',' << ov.pts[2].y
-                    << ',' << ov.mid.x    << ',' << ov.mid.y << '\n';
+                    << ',' << ov.mid.x    << ',' << ov.mid.y
+                    << ",1," << (ov.reason ? ov.reason : "ok") << ',' << ov.run << '\n';
         else
-            ir_csv_ << ",,,,,,,\n";   // eslesme yok -> kose sutunlari bos
+            ir_csv_ << ",,,,,,,,0,,0\n";   // eslesme yok -> kose sutunlari bos
         if (++ir_csv_lines_ % 15 == 0) ir_csv_.flush();
     }
 
@@ -1543,6 +1581,7 @@ private:
                 am.min_range = 0.0f; am.max_range = 100.0f;
                 am.range     = avgRange;
                 alt_pub_->publish(am);
+                hrvs_last_ms_.store(msSinceStart());   // IR kurali B: radar tazeligi
 
                 std::lock_guard<std::mutex> lk(hrvs_mutex_);
                 hrvs_data_.timeStamp   = static_cast<uint32_t>(ts_ms);
@@ -1750,6 +1789,15 @@ private:
     float       ir_leg_a_m_ = 1.36f, ir_leg_b_m_ = 1.36f;
     float       ir_tol_frac_ = 0.12f;
     float       ir_z_tol_    = 0.50f;   // optik Z vs radar Z kaba capraz kontrol
+    // Sahte ucgen kurallari (02_11, processIr): A/B/D
+    int         ir_max_blobs_valid_ = 6;      // A: daha kalabalik sahne -> gecersiz
+    bool        ir_require_radar_   = true;   // B: radar yok/bayat -> gecersiz
+    uint32_t    ir_radar_stale_ms_  = 1500;
+    int         ir_min_consec_      = 5;      // D: ardisik kararli kare (30 fps ~170 ms)
+    double      ir_max_jump_px_     = 20.0;
+    int         ir_run_ = 0;                  // yalniz imgCb thread'i
+    cv::Point2f ir_last_mid_;
+    std::atomic<uint32_t> hrvs_last_ms_{0};   // son yeni radar karesi (msSinceStart); 0 = hic
     double      ir_min_area_ = 1.0, ir_max_area_ = 400.0, ir_min_thresh_ = 240.0;
     std::string camera_info_topic_;
     // Tespit scratch'i - sadece imgCb thread'inden kullanilir, her karede

@@ -92,6 +92,11 @@ public:
                                       // GITMIYOR — dogrulama + HUD'da metrik
                                       // karsiligi gostermek icin
         float       z_radar = 0;      // ayni andaki HRVS altitude — karsilastirma
+        // Geometriye uyan ama GECERSIZ sayilan aday (02_11 gunduz sahte ucgen kurallari):
+        // videoda kirmizi cizilir, sebep HUD'da — gece testinde esik ayari icin.
+        bool        cand = false;     // pts/mid dolu (gecerli ya da reddedilmis aday)
+        const char *reason = nullptr; // nullptr = gecerli; aksi halde red sebebi
+        int         run = 0;          // ardisik kararli kare sayisi
         // Esikten gecen TUM parlak noktalar (<=16). Ucgen eslesmese de cizilir:
         // esik ayarinda 'nerede/neyi yakaladi' sorusu ancak boyle gorulur.
         std::vector<cv::Point2f> blobs;
@@ -277,6 +282,11 @@ private:
             cv::circle(img, m, 11, CYAN, 2, cv::LINE_AA);
             cv::line(img, m + cv::Point(-16, 0), m + cv::Point(16, 0), CYAN, 1, cv::LINE_AA);
             cv::line(img, m + cv::Point(0, -16), m + cv::Point(0, 16), CYAN, 1, cv::LINE_AA);
+        } else if (st.ir.cand) {   // reddedilen aday: ince kirmizi ucgen
+            for (int i = 0; i < 3; ++i)
+                cv::line(img, cv::Point((int)(st.ir.pts[i].x * k), (int)(st.ir.pts[i].y * k)),
+                         cv::Point((int)(st.ir.pts[(i + 1) % 3].x * k), (int)(st.ir.pts[(i + 1) % 3].y * k)),
+                         RED, 1, cv::LINE_AA);
         }
 
         // Akis oku (merkezden; hover hareketleri gorunsun diye x15 buyutme)
@@ -321,6 +331,10 @@ private:
                 st.ir.x * st.ir.z, st.ir.y * st.ir.z,
                 st.ir.no_alt ? " (radar yok)" : "",
                 st.ir.n_blobs, st.ir.min_area, st.ir.fit_err);
+        else if (st.ir.cand && st.ir.reason)
+            std::snprintf(l3, sizeof(l3),
+                "IR:RED  %-20s dizi=%d  Zopt %.2f radar %.2f  blob=%d err=%.2f",
+                st.ir.reason, st.ir.run, st.ir.z, st.ir.z_radar, st.ir.n_blobs, st.ir.fit_err);
         else
             std::snprintf(l3, sizeof(l3),
                 "IR:YOK  ucgen eslesmedi                blob=%d err=%.2f",
