@@ -373,7 +373,9 @@ def generate_launch_description():
                 'nvinfer_config':  cfg,
                 'image_topic':       '/camera/camera/color/image_raw',
                 'camera_info_topic': '/camera/camera/color/camera_info',
-                'vehicle_classes': [3, 5],       # VisDrone: car + truck (diger dronedaki ayar)
+                # VisDrone: car + van + truck. van 02_11 eklendi: hedef Hilux (kasasi yesil
+                # cisimle kapli) pikap oldugu icin van sayilabilir — kilit kacmasin.
+                'vehicle_classes': [3, 4, 5],
                 'mux_width':       1280,
                 'mux_height':      720,
                 'record_video':    ParameterValue(LaunchConfiguration('car_record'), value_type=bool),
