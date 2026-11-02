@@ -27,6 +27,7 @@
 #include <isaac_ros_apriltag_interfaces/msg/april_tag_detection_array.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/range.hpp>        // HRVS irtifasi -> car_detector boy filtresi
 #include <geometry_msgs/msg/vector3_stamped.hpp>   // infra2 optik akis (x=dx y=dy z=Q)
 #include <cv_bridge/cv_bridge.h>
 
@@ -669,6 +670,9 @@ public:
             std::snprintf(ses, sizeof(ses), "hrvs_s%04d", record_session_);
             hrvs_debug_dir_ = dir + "/" + ses + "/";
         }
+        alt_pub_ = create_publisher<sensor_msgs::msg::Range>(
+            declare_parameter<std::string>("altitude_topic", "/hrvs/altitude"),
+            rclcpp::SensorDataQoS());
         if (declare_parameter<bool>("hrvs_enabled", true))
             hrvs_thread_ = std::thread(&SerialSenderNode::hrvsThread, this);
         else
@@ -1531,6 +1535,15 @@ private:
                 auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - startTime).count();
 
+                // Irtifa -> car_detector boy filtresi. SADECE yeni radar karesinde: radar
+                // donarsa mesaj kesilir ve car_detector filtreyi kendiliginden kapatir.
+                sensor_msgs::msg::Range am;
+                am.header.stamp    = now();
+                am.header.frame_id = "hrvs";
+                am.min_range = 0.0f; am.max_range = 100.0f;
+                am.range     = avgRange;
+                alt_pub_->publish(am);
+
                 std::lock_guard<std::mutex> lk(hrvs_mutex_);
                 hrvs_data_.timeStamp   = static_cast<uint32_t>(ts_ms);
                 hrvs_data_.altitude    = static_cast<uint16_t>(avgRange * 100.0f);
@@ -1694,6 +1707,8 @@ private:
     int                tx_cpu_ = 5;   // -1 = CPU pin kapali
 
     /* RX thread - otopilot -> Jetson (0x49 KAPAT) */
+    rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
+
     std::thread           rx_thread_;
     std::atomic<bool>     rx_running_{true};
     std::atomic<uint32_t> rx_bytes_{0};          // [SERIAL] logunda saniyelik

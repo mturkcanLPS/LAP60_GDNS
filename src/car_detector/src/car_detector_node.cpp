@@ -28,6 +28,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/range.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 
 #include <opencv2/opencv.hpp>
@@ -96,7 +97,8 @@ static std::string claimRecordPath(const std::string &dir, const std::string &pr
 
 class CarDetector : public rclcpp::Node {
   // OpenCV recorder overlay tipleri — onlari kullanan fonksiyonlardan ONCE tanimli olmali
-  struct RecBox { float left, top, w, h; long id; float conf; bool locked; };
+  struct RecBox { float left, top, w, h; long id; float conf; bool locked;
+                  float len_m; bool rejected; };   // len_m < 0: boy hesaplanamadi
   struct RecOverlay {
     std::vector<RecBox> boxes;
     long   locked_id = -1;
@@ -104,6 +106,7 @@ class CarDetector : public rclcpp::Node {
     float  conf = 0;
     bool   valid = false;
     bool   have_k = false;   // intrinsics var mi (valid=false'un sebebini ayirmak icin)
+    double alt = -1;         // boy filtresinin kullandigi HRVS irtifasi; <0: filtre kapali
   };
 
 public:
@@ -167,6 +170,18 @@ public:
                         std::vector<int64_t>{3, 4, 5, 8});  // VisDrone: car/van/truck/bus
     for (auto c : vcls) vehicle_cls_.insert(static_cast<int>(c));
 
+    // Boy filtresi (02_11): kutunun uzun kenari + HRVS irtifasi -> gercek boy. Yerdeki
+    // tag levhasi (~1 m) ve cim gibi yanlis tespitleri KILITLEMEDEN once eler.
+    // Olcum (#42 Egea 4.53 m, 16-64 m): 3.7-6.3 m cikti; levha 1.0 m. Hilux 5.32 m
+    // ayni oranla ~4.3-7.4 m. Uzun kenar arac donse de ~boy kalir (en-boy orani degil).
+    // HRVS bayatsa (radar donmus/kopuk) ya da intrinsics yoksa filtre KAPALI (eski davranis).
+    size_filter_   = declare_parameter<bool>("size_filter_enable", true);
+    len_min_m_     = declare_parameter<double>("car_len_min_m", 2.5);
+    len_max_m_     = declare_parameter<double>("car_len_max_m", 9.0);
+    alt_stale_s_   = declare_parameter<double>("altitude_stale_s", 1.5);
+    edge_px_       = declare_parameter<int>("size_edge_px", 4);   // kenara degen kutu kesik: sadece ust sinir
+    alt_topic_     = declare_parameter<std::string>("altitude_topic", "/hrvs/altitude");
+
     // intrinsics: param > 0 ise onu kullan, degilse camera_info bekle
     double fx = declare_parameter<double>("fx", 0.0);
     double fy = declare_parameter<double>("fy", 0.0);
@@ -206,6 +221,12 @@ public:
     sub_ci_ = create_subscription<sensor_msgs::msg::CameraInfo>(
         cinfo_topic_, qos,
         std::bind(&CarDetector::onCameraInfo, this, std::placeholders::_1));
+    // serial_sender her YENI radar karesinde yayinlar; radar donarsa mesaj kesilir.
+    sub_alt_ = create_subscription<sensor_msgs::msg::Range>(
+        alt_topic_, qos, [this](const sensor_msgs::msg::Range::SharedPtr m) {
+          alt_m_.store(m->range);
+          alt_ns_.store(nowNs());
+        });
 
     buildPipeline();
 
@@ -214,9 +235,10 @@ public:
 
     RCLCPP_INFO(get_logger(),
         "car_detector hazir | in='%s' mux=%dx%d track_gate=%.0f reacq_gate=%.0f conf>=%.2f"
-        " | copy_hw=%d max_rss=%dMB stall=%.1fs",
+        " | copy_hw=%d max_rss=%dMB stall=%.1fs | boy filtresi %s %.1f-%.1f m (irtifa '%s', bayat>%.1fs)",
         image_topic_.c_str(), W_, H_, track_gate_px_, reacq_gate_px_, conf_th_,
-        copy_hw_, max_rss_mb_, stall_timeout_s_);
+        copy_hw_, max_rss_mb_, stall_timeout_s_,
+        size_filter_ ? "ACIK" : "KAPALI", len_min_m_, len_max_m_, alt_topic_.c_str(), alt_stale_s_);
     if (test_fail_after_s_ > 0)
       RCLCPP_WARN(get_logger(), "TEST: %.0f sn sonra %s pipeline hatasi enjekte edilecek",
                   test_fail_after_s_, test_fail_silent_ ? "SESSIZ" : "bus ERROR'lu");
@@ -591,13 +613,17 @@ private:
 
   // k: kayit olcegi — kutular mux (tam cozunurluk) koordinatinda, kareyle birlikte olceklenir
   void drawRecOverlay(cv::Mat &img, const RecOverlay &ov, float k = 1.0f) {
-    for (const auto &b : ov.boxes) {   // kilitli=yesil kalin, aday=turuncu (BGR)
-      cv::Scalar col = b.locked ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
+    for (const auto &b : ov.boxes) {   // kilitli=yesil kalin, aday=turuncu, boyla elenen=kirmizi (BGR)
+      cv::Scalar col = b.rejected ? cv::Scalar(0, 0, 255)
+                     : b.locked   ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
       cv::rectangle(img, cv::Rect((int)(b.left * k), (int)(b.top * k),
                                   (int)(b.w * k), (int)(b.h * k)),
-                    col, b.locked ? 3 : 2);
+                    col, b.locked ? 3 : b.rejected ? 1 : 2);
       char t[48];
-      snprintf(t, sizeof(t), "%ld:%.2f", b.id, b.conf);
+      if (b.len_m >= 0)
+        snprintf(t, sizeof(t), "%ld:%.2f L=%.1fm%s", b.id, b.conf, b.len_m, b.rejected ? " X" : "");
+      else
+        snprintf(t, sizeof(t), "%ld:%.2f", b.id, b.conf);
       cv::putText(img, t, cv::Point((int)(b.left * k), (int)(b.top * k) - 6),
                   cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 2, cv::LINE_AA);
     }
@@ -617,6 +643,14 @@ private:
       snprintf(l2, sizeof(l2), "px=(%.0f,%.0f)  bx=%.3f by=%.3f", ov.u, ov.v, ov.bx, ov.by);
     cv::putText(img, l1, cv::Point(10, 18), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                 cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    // Boy filtresi durumu (sag ust): kullanilan irtifa ya da neden kapali
+    char l3[64];
+    if (ov.alt >= 0) snprintf(l3, sizeof(l3), "HRVS %.1fm  boy %.1f-%.1fm", ov.alt, len_min_m_, len_max_m_);
+    else             snprintf(l3, sizeof(l3), "boy filtresi KAPALI");
+    int base = 0;
+    const cv::Size ts = cv::getTextSize(l3, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &base);
+    cv::putText(img, l3, cv::Point(img.cols - ts.width - 8, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                ov.alt >= 0 ? cv::Scalar(255, 255, 255) : cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     if (l2[0])
       cv::putText(img, l2, cv::Point(10, 38), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                   cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
@@ -638,34 +672,86 @@ private:
 
     for (NvDsMetaList *lf = batch->frame_meta_list; lf; lf = lf->next) {
       auto *fm = reinterpret_cast<NvDsFrameMeta *>(lf->data);
-      std::vector<Cand> cands;
+      const SizeGate g = sizeGate();
+      std::vector<Cand> cands, rejected;
       for (NvDsMetaList *lo = fm->obj_meta_list; lo; lo = lo->next) {
         auto *o = reinterpret_cast<NvDsObjectMeta *>(lo->data);
         if (vehicle_cls_.count(o->class_id) &&
             o->confidence >= conf_th_) {
-          double u = o->rect_params.left + o->rect_params.width * 0.5;
-          double v = o->rect_params.top + o->rect_params.height * 0.5;
-          cands.push_back({(long)o->object_id, u, v, (float)o->confidence, o});
+          const auto &r = o->rect_params;
+          double u = r.left + r.width * 0.5;
+          double v = r.top + r.height * 0.5;
+          Cand c{(long)o->object_id, u, v, (float)o->confidence, o, carLength(g, r, u, v)};
+          if (g.on && !lengthOk(c.len_m, r)) rejected.push_back(c);
+          else                               cands.push_back(c);
         }
       }
+      if (!rejected.empty())
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+            "BOY: %zu aday elendi (ilki id=%ld L=%.2f m) | irtifa %.1f m, sinir %.1f-%.1f m",
+            rejected.size(), rejected[0].id, rejected[0].len_m, g.alt, len_min_m_, len_max_m_);
       updateLock(cands);
       if (osd_active_) annotate(batch, fm, cands);        // sadece display (nvdsosd)
-      if (record_video_ && !display_) buildRecOverlay(cands);  // OpenCV recorder icin
+      if (record_video_ && !display_) buildRecOverlay(cands, rejected, g);  // OpenCV recorder icin
     }
     return GST_PAD_PROBE_OK;
   }
 
-  struct Cand { long id; double u, v; float conf; NvDsObjectMeta *om; };
+  struct Cand { long id; double u, v; float conf; NvDsObjectMeta *om; double len_m; };
+
+  // ---- boy filtresi ----
+  struct SizeGate { bool on = false; double alt = -1, fx = 0, fy = 0, cx = 0, cy = 0; };
+
+  // Filtre bu kare icin acik mi: HRVS taze (alt_stale_s icinde yeni kare) ve intrinsics var.
+  SizeGate sizeGate() {
+    SizeGate g;
+    if (!size_filter_) return g;
+    const int64_t t = alt_ns_.load();
+    const double alt = alt_m_.load();
+    if (t == 0 || nowNs() - t > (int64_t)(alt_stale_s_ * 1e9) || !(alt > 0.1)) return g;
+    std::lock_guard<std::mutex> lk(k_mtx_);
+    if (!have_K_) return g;
+    g.fx = K_.at<double>(0, 0); g.fy = K_.at<double>(1, 1);
+    g.cx = K_.at<double>(0, 2); g.cy = K_.at<double>(1, 2);
+    g.alt = alt; g.on = true;
+    return g;
+  }
+
+  // Kutunun uzun kenari -> metre. Merkez disindaki hedef daha uzakta (duz zemin, asagi
+  // bakan kamera): Z = irtifa * sqrt(1 + bx^2 + by^2). Filtre kapaliysa -1.
+  static double carLength(const SizeGate &g, const NvOSD_RectParams &r, double u, double v) {
+    if (!g.on) return -1;
+    const double bx = (u - g.cx) / g.fx, by = (v - g.cy) / g.fy;
+    const double Z = g.alt * std::sqrt(1.0 + bx * bx + by * by);
+    return std::max(r.width / g.fx, r.height / g.fy) * Z;
+  }
+
+  // Kenara degen kutu kesik olabilir (arac kadraja sigmiyor) -> sadece ust sinir.
+  bool lengthOk(double L, const NvOSD_RectParams &r) const {
+    if (L > len_max_m_) return false;
+    const bool clipped = r.left <= edge_px_ || r.top <= edge_px_ ||
+                         r.left + r.width >= W_ - edge_px_ || r.top + r.height >= H_ - edge_px_;
+    return clipped || L >= len_min_m_;
+  }
 
   // Probe'daki tespitleri OpenCV recorder icin snapshot'a al (onImage cizecek).
-  void buildRecOverlay(const std::vector<Cand> &cands) {
+  // Boy filtresinin eledikleri de cizilir (kirmizi) — kayittan sinir ayari icin.
+  void buildRecOverlay(const std::vector<Cand> &cands, const std::vector<Cand> &rejected,
+                       const SizeGate &g) {
     RecOverlay ov;
-    ov.boxes.reserve(cands.size());
+    ov.boxes.reserve(cands.size() + rejected.size());
     for (const auto &c : cands) {
       const auto &r = c.om->rect_params;
       ov.boxes.push_back({(float)r.left, (float)r.top, (float)r.width, (float)r.height,
-                          c.id, c.conf, (locked_id_ >= 0 && c.id == locked_id_)});
+                          c.id, c.conf, (locked_id_ >= 0 && c.id == locked_id_),
+                          (float)c.len_m, false});
     }
+    for (const auto &c : rejected) {
+      const auto &r = c.om->rect_params;
+      ov.boxes.push_back({(float)r.left, (float)r.top, (float)r.width, (float)r.height,
+                          c.id, c.conf, false, (float)c.len_m, true});
+    }
+    ov.alt = g.on ? g.alt : -1;
     ov.locked_id = locked_id_;
     ov.bx = pub_bx_; ov.by = pub_by_; ov.u = pub_u_; ov.v = pub_v_;
     ov.conf = (float)pub_conf_; ov.valid = pub_valid_;
@@ -742,8 +828,8 @@ private:
       }
       lockTo(best->id, best->u, best->v, true);
       pub_conf_ = best->conf;
-      RCLCPP_INFO(get_logger(), "KILIT acildi -> id=%ld @(%.0f,%.0f) conf=%.2f",
-                  best->id, best->u, best->v, best->conf);
+      RCLCPP_INFO(get_logger(), "KILIT acildi -> id=%ld @(%.0f,%.0f) conf=%.2f L=%.1fm",
+                  best->id, best->u, best->v, best->conf, best->len_m);
       publishBearing(best->id, best->u, best->v);
       return;
     }
@@ -935,6 +1021,15 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_ci_;
+  rclcpp::Subscription<sensor_msgs::msg::Range>::SharedPtr sub_alt_;
+
+  // ---- boy filtresi (HRVS irtifasi) ----
+  bool   size_filter_ = true;
+  double len_min_m_ = 2.5, len_max_m_ = 9.0, alt_stale_s_ = 1.5;
+  int    edge_px_ = 4;
+  std::string alt_topic_;
+  std::atomic<double>  alt_m_{0.0};
+  std::atomic<int64_t> alt_ns_{0};   // son HRVS mesaji (steady ns); 0 = hic gelmedi
 };
 
 int main(int argc, char **argv) {

@@ -112,6 +112,8 @@ journalctl -u apriltag_bringup -f           # canlı log
 
 Servisi durdurup elle çalıştırmak için: `ros2 launch lps_bringup bringup.launch.py car_model:=640`.
 
+**Araç boy filtresi:** serial_sender her yeni radar karesinde irtifayı `/hrvs/altitude`'a yayınlar. car_detector kutunun uzun kenarını bu irtifayla metreye çevirir ve 2.5–9 m dışındaki adayları kilitlemeden eler (örneğin yerdeki ~1 m'lik tag levhası). Son irtifa 1.5 s'den eskiyse filtre kapanır. EO kaydında elenen kutular kırmızı çizilir ve yanlarında `L=…m` yazar. Parametreler: `size_filter_enable`, `car_len_min_m`, `car_len_max_m`, `altitude_stale_s`.
+
 **Kayıtlar** `/home/lapis/lps_records` altına yazılır. Servis her açılışta bir oturum numarası alır (`.oturum_sayaci`). Dosya adları bu numarayı taşır (`eo_s0036_...avi`, `hrvs_s0036/`), restart olunca eski kayıtların üstüne yazılmaz.
 
 **İzleme betikleri** (`src/lps_bringup/scripts/`, root gerekmez):
@@ -132,6 +134,7 @@ Little-endian, packed. Yapılar ve `static_assert`'ler `serial_sender_node.cpp`'
 |---|---|---|---|
 | `0x42` | 133 B | 50 Hz | hrvs, apriltag, opticflow, ir, apriltag2, opticflow2, car |
 | `0x48` | 31 B | 1 Hz | Sistem sağlığı. Ana paketin hemen arkasından aynı thread'den yazılır. |
+| `0x49` (otopilot → Jetson) | 6 B | — | KAPAT: `BB 49 01 FB 01 FF` gelince Jetson düzgün kapanır (`systemctl poweroff`). Kapatmak için `autopilot_poweroff_enable:=false`. |
 
 - **Bearing ve IR alanları metre ya da açı değildir.** İkisi de boyutsuz yön birimidir (X/Z, Y/Z = tan). Değerler kamera optik frame'indedir.
 - **Geçici:** `0x48`'in `cpuTemp` alanında şu an CPU yerine HRVS radarlarının en yüksek çip sıcaklığı gidiyor. Geri almak için launch'ta `serial_sender` parametrelerine `'health_cpu_temp_source': 'cpu'` eklenir.
