@@ -179,7 +179,8 @@ public:
     len_min_m_     = declare_parameter<double>("car_len_min_m", 2.5);
     len_max_m_     = declare_parameter<double>("car_len_max_m", 9.0);
     alt_stale_s_   = declare_parameter<double>("altitude_stale_s", 1.5);
-    edge_px_       = declare_parameter<int>("size_edge_px", 4);   // kenara degen kutu kesik: sadece ust sinir
+    edge_px_       = declare_parameter<int>("size_edge_px", 4);   // kenara degen kutu kesik sayilir
+    wid_min_m_     = declare_parameter<double>("car_width_min_m", 1.2);   // kesik kutuda paralel boyut alt siniri
     alt_topic_     = declare_parameter<std::string>("altitude_topic", "/hrvs/altitude");
 
     // intrinsics: param > 0 ise onu kullan, degilse camera_info bekle
@@ -682,7 +683,7 @@ private:
           double u = r.left + r.width * 0.5;
           double v = r.top + r.height * 0.5;
           Cand c{(long)o->object_id, u, v, (float)o->confidence, o, carLength(g, r, u, v)};
-          if (g.on && !lengthOk(c.len_m, r)) rejected.push_back(c);
+          if (g.on && !lengthOk(g, c.len_m, r, u, v)) rejected.push_back(c);
           else                               cands.push_back(c);
         }
       }
@@ -717,21 +718,32 @@ private:
     return g;
   }
 
-  // Kutunun uzun kenari -> metre. Merkez disindaki hedef daha uzakta (duz zemin, asagi
-  // bakan kamera): Z = irtifa * sqrt(1 + bx^2 + by^2). Filtre kapaliysa -1.
-  static double carLength(const SizeGate &g, const NvOSD_RectParams &r, double u, double v) {
-    if (!g.on) return -1;
+  // Merkez disindaki hedef daha uzakta (duz zemin, asagi bakan kamera).
+  static double slantZ(const SizeGate &g, double u, double v) {
     const double bx = (u - g.cx) / g.fx, by = (v - g.cy) / g.fy;
-    const double Z = g.alt * std::sqrt(1.0 + bx * bx + by * by);
-    return std::max(r.width / g.fx, r.height / g.fy) * Z;
+    return g.alt * std::sqrt(1.0 + bx * bx + by * by);
   }
 
-  // Kenara degen kutu kesik olabilir (arac kadraja sigmiyor) -> sadece ust sinir.
-  bool lengthOk(double L, const NvOSD_RectParams &r) const {
+  // Kutunun uzun kenari -> metre. Filtre kapaliysa -1.
+  static double carLength(const SizeGate &g, const NvOSD_RectParams &r, double u, double v) {
+    if (!g.on) return -1;
+    return std::max(r.width / g.fx, r.height / g.fy) * slantZ(g, u, v);
+  }
+
+  // Kenara degen kutu kesik olabilir (arac kadraja sigmiyor): alt sinir yerine, kesilen
+  // kenara PARALEL boyut (o kesilmez) en az arac genisligi kadar olmali; koseye degen
+  // kutu serbest. Kenardaki kucuk cim/tag parcasi boylece gecemez (tum ucuslarin
+  // kaydiyla sinandi: 3 m alti kabul 111 -> 0, arac kayipsiz).
+  bool lengthOk(const SizeGate &g, double L, const NvOSD_RectParams &r, double u, double v) const {
     if (L > len_max_m_) return false;
-    const bool clipped = r.left <= edge_px_ || r.top <= edge_px_ ||
-                         r.left + r.width >= W_ - edge_px_ || r.top + r.height >= H_ - edge_px_;
-    return clipped || L >= len_min_m_;
+    if (L >= len_min_m_) return true;
+    const bool eL = r.left <= edge_px_, eR = r.left + r.width >= W_ - edge_px_;
+    const bool eT = r.top <= edge_px_,  eB = r.top + r.height >= H_ - edge_px_;
+    if (!(eL || eR || eT || eB)) return false;
+    if ((eL || eR) && (eT || eB)) return true;   // kose
+    const double Z = slantZ(g, u, v);
+    const double par = (eL || eR) ? r.height / g.fy * Z : r.width / g.fx * Z;
+    return par >= wid_min_m_;
   }
 
   // Probe'daki tespitleri OpenCV recorder icin snapshot'a al (onImage cizecek).
@@ -1025,7 +1037,7 @@ private:
 
   // ---- boy filtresi (HRVS irtifasi) ----
   bool   size_filter_ = true;
-  double len_min_m_ = 2.5, len_max_m_ = 9.0, alt_stale_s_ = 1.5;
+  double len_min_m_ = 2.5, len_max_m_ = 9.0, alt_stale_s_ = 1.5, wid_min_m_ = 1.2;
   int    edge_px_ = 4;
   std::string alt_topic_;
   std::atomic<double>  alt_m_{0.0};

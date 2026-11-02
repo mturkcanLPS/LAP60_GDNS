@@ -112,7 +112,7 @@ journalctl -u apriltag_bringup -f           # canlı log
 
 Servisi durdurup elle çalıştırmak için: `ros2 launch lps_bringup bringup.launch.py car_model:=640`.
 
-**Araç boy filtresi:** serial_sender her yeni radar karesinde irtifayı `/hrvs/altitude`'a yayınlar. car_detector kutunun uzun kenarını bu irtifayla metreye çevirir ve 2.5–9 m dışındaki adayları kilitlemeden eler (örneğin yerdeki ~1 m'lik tag levhası). Son irtifa 1.5 s'den eskiyse filtre kapanır. EO kaydında elenen kutular kırmızı çizilir ve yanlarında `L=…m` yazar. Parametreler: `size_filter_enable`, `car_len_min_m`, `car_len_max_m`, `altitude_stale_s`.
+**Araç boy filtresi:** serial_sender her yeni radar karesinde irtifayı `/hrvs/altitude`'a yayınlar. car_detector kutunun uzun kenarını bu irtifayla metreye çevirir ve 2.5–9 m dışındaki adayları kilitlemeden eler (örneğin yerdeki ~1 m'lik tag levhası). Son irtifa 1.5 s'den eskiyse filtre kapanır. EO kaydında elenen kutular kırmızı çizilir ve yanlarında `L=…m` yazar. Kutu görüntü kenarına değiyorsa (araç kesik) alt sınır yerine kenara paralel boyutun en az 1.2 m olması aranır. Parametreler: `size_filter_enable`, `car_len_min_m`, `car_len_max_m`, `car_width_min_m`, `altitude_stale_s`.
 
 **Kayıtlar** `/home/lapis/lps_records` altına yazılır. Servis her açılışta bir oturum numarası alır (`.oturum_sayaci`). Dosya adları bu numarayı taşır (`eo_s0036_...avi`, `hrvs_s0036/`), restart olunca eski kayıtların üstüne yazılmaz.
 
