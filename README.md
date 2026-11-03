@@ -136,6 +136,7 @@ Little-endian, packed. Yapılar ve `static_assert`'ler `serial_sender_node.cpp`'
 | `0x48` | 31 B | 1 Hz | Sistem sağlığı. Ana paketin hemen arkasından aynı thread'den yazılır. |
 | `0x49` (otopilot → Jetson) | 6 B | — | KAPAT: `BB 49 01 FB 01 FF` gelince Jetson düzgün kapanır (`systemctl poweroff`). Kapatmak için `autopilot_poweroff_enable:=false`. |
 
+- **`aprtiltag` ve `opticflow` iki IR kameranın birleşimidir.** AprilTag konumu **platform merkezine göredir**: her kameranın ofseti (infra1 32.962/45 mm, infra2 −17.962/45 mm) kamera ekseninde düşülür, eksenler kamera ekseni kalır. `aprtiltag2` / `opticflow2` sadece infra2'dir (karşılaştırma için). Kapatmak için `dual_camera_fusion:=false`.
 - **Bearing ve IR alanları metre ya da açı değildir.** İkisi de boyutsuz yön birimidir (X/Z, Y/Z = tan). Değerler kamera optik frame'indedir.
 - **Geçici:** `0x48`'in `cpuTemp` alanında şu an CPU yerine HRVS radarlarının en yüksek çip sıcaklığı gidiyor. Geri almak için launch'ta `serial_sender` parametrelerine `'health_cpu_temp_source': 'cpu'` eklenir.
 

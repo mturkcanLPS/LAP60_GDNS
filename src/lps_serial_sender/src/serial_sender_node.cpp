@@ -44,6 +44,7 @@
 #include "lps_serial_sender/frame_gap_stats.hpp"  // akis kare araligi duzenliligi
 #include "lps_serial_sender/system_health.hpp"    // Jetson sicaklik/yuk/guc -> health alani
 #include "lps_serial_sender/autopilot_rx.hpp"     // otopilot -> Jetson mesajlari (0x49 KAPAT)
+#include "lps_serial_sender/dual_camera_fusion.hpp"  // infra1+infra2: tag avgPos + akis birlesimi
 #include <cstdlib>                                // std::system (kapatma komutu)
 
 #include <fstream>
@@ -415,6 +416,39 @@ static apriltagPack_t packFromFusion(const lps::TagFusion &f, uint32_t ts)
     return ap;
 }
 
+/* apriltagPack_t <-> lps::TagSample (iki kamera birlesimi, dual_camera_fusion.hpp) */
+static lps::TagSample tagSample(const apriltagPack_t &ap, bool fresh)
+{
+    const auto &v = ap.avgPos.validity;
+    lps::TagSample s;
+    s.ok   = fresh && v.valid;
+    s.x    = ap.avgPos.pos.x;      s.y = ap.avgPos.pos.y;      s.z = ap.avgPos.pos.z;
+    s.roll = ap.avgPos.angle.roll; s.pitch = ap.avgPos.angle.pitch; s.yaw = ap.avgPos.angle.yaw;
+    s.bits = (uint8_t)(v.valid1 | v.valid2 << 1 | v.valid3 << 2 | v.valid4 << 3 |
+                       v.valid5 << 4 | v.valid6 << 5 | v.valid7 << 6 | v.valid8 << 7);
+    return s;
+}
+
+static apriltagPack_t tagPack(const lps::TagSample &s, uint32_t ts)
+{
+    lps::TagFusion f;
+    f.valid = s.ok;
+    f.pos   = cv::Vec3f(s.x, s.y, s.z);
+    f.roll  = s.roll; f.pitch = s.pitch; f.yaw = s.yaw;
+    f.id_bits = s.bits;
+    return packFromFusion(f, ts);
+}
+
+/* Kameranin platform merkezine ofsetini dus (kamera ekseninde, m). Ofset = kameradan
+   platform merkezine vektor; kamera govdeye rijit oldugu icin kamera ekseninde SABIT —
+   yaw/egim donusunde bozulmaz. Sadece gecerli tespitte (gecersizde pos 0 kalsin). */
+static void subtractCamOffset(apriltagPack_t &ap, const double off[2])
+{
+    if (!ap.avgPos.validity.valid) return;
+    ap.avgPos.pos.x -= (float)off[0];
+    ap.avgPos.pos.y -= (float)off[1];
+}
+
 /* ------------------------------------------------------------------ */
 /* IR LED ucgeni - tespit + eslesme: ir_triangle.hpp (test ile ORTAK)  */
 /* ------------------------------------------------------------------ */
@@ -639,6 +673,23 @@ public:
         // bu topic'ler sessiz kalir ve alanlar SIFIR gider (valid=0, Q=0, ts=0).
         infra2_tag_topic_  = declare_parameter<std::string>("infra2_tag_topic",  "/tag_detections_infra2");
         infra2_flow_topic_ = declare_parameter<std::string>("infra2_flow_topic", "/infra2/optical_flow");
+
+        // Iki kamera birlesimi + platform merkezi ofseti (03_11, dual_camera_fusion.hpp).
+        // Ofset = kameradan platform merkezine vektor, KAMERA ekseninde (x saga, y asagi), m.
+        // Kayitla dogrulandi: farklari (50.9 mm) kameralar arasi baseline; dusulunce iki
+        // kameranin tag konumu ortusuyor (ham +45 mm -> -6 mm).
+        {
+            const auto o1 = declare_parameter<std::vector<double>>("cam_offset_infra1", {0.032962, 0.045});
+            const auto o2 = declare_parameter<std::vector<double>>("cam_offset_infra2", {-0.017962, 0.045});
+            if (o1.size() >= 2) { cam_off1_[0] = o1[0]; cam_off1_[1] = o1[1]; }
+            if (o2.size() >= 2) { cam_off2_[0] = o2[0]; cam_off2_[1] = o2[1]; }
+        }
+        dual_fusion_     = declare_parameter<bool>("dual_camera_fusion", true);
+        tag_pair_tol_m_  = (float)declare_parameter<double>("tag_pair_tol_m", 0.30);   // tutarsizsa infra1
+        tag_fresh_ms_    = (uint32_t)declare_parameter<int>("tag_fresh_ms", 200);      // 15 Hz x3
+        flow_fresh_ms_   = (uint32_t)declare_parameter<int>("flow_fresh_ms", 100);     // 30 Hz x3
+        flow_agree_px_   = (float)declare_parameter<double>("flow_agree_px", 1.0);
+        flow_agree_frac_ = (float)declare_parameter<double>("flow_agree_frac", 0.3);
         tag2_sub_ = create_subscription<
             isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>(
             infra2_tag_topic_, rclcpp::SensorDataQoS(),
@@ -744,7 +795,8 @@ private:
         // avgPos fuzyonu tag_fusion.hpp'de (infra2 ile ORTAK). Mod (huni / 45-24)
         // orada TEST_APRITLAG ile.
         const lps::TagFusion f = lps::fuseTags(lps::toTagDets(*msg), apriltag_node_size_);
-        const apriltagPack_t ap = packFromFusion(f, msSinceStart());
+        apriltagPack_t ap = packFromFusion(f, msSinceStart());
+        subtractCamOffset(ap, cam_off1_);   // -> platform merkezine gore
 
         // Video overlay: huni tag'lerinin (duvar+kucuk) kose koordinatlari.
         std::vector<lps::DebugRecorder::TagOverlay> overlays;
@@ -775,7 +827,8 @@ private:
     {
         tag2_cb_count_++;
         const lps::TagFusion f = lps::fuseTags(lps::toTagDets(*msg), apriltag_node_size_);
-        const apriltagPack_t ap = packFromFusion(f, msSinceStart());
+        apriltagPack_t ap = packFromFusion(f, msSinceStart());
+        subtractCamOffset(ap, cam_off2_);   // -> platform merkezine gore (aprtiltag2 de)
         std::lock_guard<std::mutex> lk(data_mutex_);
         apriltag2_ = ap;
     }
@@ -1189,6 +1242,44 @@ private:
             ir_ov_copy = ir_overlay_;
         }
 
+        // ---- infra1 + infra2 birlesimi (03_11, dual_camera_fusion.hpp) ----
+        // Pakete giden aprtiltag / opticflow = iki kameranin birlesimi; aprtiltag2 /
+        // opticflow2 infra2'nin kendisi olarak kalir (karsilastirma). Bayat kamera
+        // (node olu / infra2 kapali) birlesime girmez.
+        if (dual_fusion_) {
+            const uint32_t now_ms = msSinceStart();
+            const auto fresh = [now_ms](uint32_t ts, uint32_t lim) {
+                return ts != 0 && now_ms - ts <= lim;
+            };
+            const lps::TagPairResult tr = lps::fuseTagPair(
+                tagSample(at_copy,  fresh(at_copy.timeStamp,  tag_fresh_ms_)),
+                tagSample(at2_copy, fresh(at2_copy.timeStamp, tag_fresh_ms_)), tag_pair_tol_m_);
+            if (tr.src) {
+                const uint32_t ts = tr.src == 1 ? at_copy.timeStamp : tr.src == 2 ? at2_copy.timeStamp
+                                  : std::max(at_copy.timeStamp, at2_copy.timeStamp);
+                at_copy = tagPack(tr.out, ts);
+            }
+            ++fus_tag_cnt_[tr.src];
+            if (tr.diff_m >= 0) { fus_tag_diff_sum_ += tr.diff_m; ++fus_tag_diff_n_; }
+
+            const auto flowSample = [&fresh, this](const opticFlowPack_t &f) {
+                lps::FlowSample s;
+                s.ok = fresh(f.timestamp, flow_fresh_ms_);
+                s.dx = f.motionPos.x; s.dy = f.motionPos.y; s.q = f.quality;
+                return s;
+            };
+            const lps::FlowPairResult fr = lps::fuseFlowPair(
+                flowSample(of_copy), flowSample(of2_copy), flow_agree_px_, flow_agree_frac_);
+            if (fr.src) {
+                of_copy.timestamp   = fr.src == 1 ? of_copy.timestamp : fr.src == 2 ? of2_copy.timestamp
+                                    : std::max(of_copy.timestamp, of2_copy.timestamp);
+                of_copy.motionPos.x = fr.out.dx;
+                of_copy.motionPos.y = fr.out.dy;
+                of_copy.quality     = fr.out.q;
+            }
+            ++fus_flow_cnt_[fr.src];
+        }
+
         jetsonOtopilotPack_ut pkt;
         std::memset(pkt.data, 0, sizeof(jetsonOtopilotPack_t));
 
@@ -1338,6 +1429,26 @@ private:
                 RCLCPP_INFO(get_logger(),
                     "[OPTICFLOW2] %.1f Hz | dx=%.3f dy=%.3f quality=%u",
                     flow2_hz, of2_copy.motionPos.x, of2_copy.motionPos.y, of2_copy.quality);
+                // Pakete GIDEN birlesik deger + son 1 s'de kaynak dagilimi (TX tick'i basina).
+                // [APRILTAG]/[APRILTAG2] kamera basina (ofset dusulmus), [OPTICFLOW]/2 ham.
+                if (dual_fusion_) {
+                    const auto pct = [](const uint32_t *c, int i) {
+                        const uint32_t s = c[0] + c[1] + c[2] + c[3];
+                        return s ? (int)std::lround(100.0 * c[i] / s) : 0;
+                    };
+                    const auto &ft = pkt.pack.variables.aprtiltag.avgPos;
+                    const auto &ff = pkt.pack.variables.opticflow;
+                    RCLCPP_INFO(get_logger(),
+                        "[FUSION]    tag: ikisi %%%d infra1 %%%d infra2 %%%d yok %%%d fark %.3f m"
+                        " | akis: ikisi %%%d infra1 %%%d infra2 %%%d yok %%%d"
+                        " | pakette pos(%.3f,%.3f,%.3f) akis(%.3f,%.3f) Q%u",
+                        pct(fus_tag_cnt_, 3), pct(fus_tag_cnt_, 1), pct(fus_tag_cnt_, 2), pct(fus_tag_cnt_, 0),
+                        fus_tag_diff_n_ ? fus_tag_diff_sum_ / fus_tag_diff_n_ : -1.0,
+                        pct(fus_flow_cnt_, 3), pct(fus_flow_cnt_, 1), pct(fus_flow_cnt_, 2), pct(fus_flow_cnt_, 0),
+                        ft.pos.x, ft.pos.y, ft.pos.z, ff.motionPos.x, ff.motionPos.y, ff.quality);
+                    for (int i = 0; i < 4; ++i) fus_tag_cnt_[i] = fus_flow_cnt_[i] = 0;
+                    fus_tag_diff_sum_ = 0; fus_tag_diff_n_ = 0;
+                }
                 // Arac: pakete GIDEN kopya (bayatlik kontrolu uygulanmis hali)
                 RCLCPP_INFO(get_logger(),
                     "[CAR]       %.1f Hz | valid=%s bearing(%+.4f,%+.4f)",
@@ -1768,6 +1879,14 @@ private:
         isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>::SharedPtr tag2_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr flow2_sub_;
     std::atomic<uint32_t> tag2_cb_count_{0}, flow2_cb_count_{0};
+
+    /* iki kamera birlesimi (03_11) — parametreler + TX thread'inin saniyelik sayaclari */
+    double   cam_off1_[2] = {0.032962, 0.045}, cam_off2_[2] = {-0.017962, 0.045};
+    bool     dual_fusion_ = true;
+    float    tag_pair_tol_m_ = 0.30f, flow_agree_px_ = 1.0f, flow_agree_frac_ = 0.3f;
+    uint32_t tag_fresh_ms_ = 200, flow_fresh_ms_ = 100;
+    uint32_t fus_tag_cnt_[4] = {0, 0, 0, 0}, fus_flow_cnt_[4] = {0, 0, 0, 0};   // [yok,1,2,ikisi]
+    double   fus_tag_diff_sum_ = 0; uint32_t fus_tag_diff_n_ = 0;
 
     /* Arac bearing'i (car_detector -> car) */
     carPack_t   car_{};                 // carCb yazar, TX okur (data_mutex_)
