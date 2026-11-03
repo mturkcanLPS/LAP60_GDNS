@@ -214,8 +214,13 @@ def generate_launch_description():
 
     # IR emitter'i kapat — rs_launch declared arg listesinde olmadigi icin
     # launch arg ile gecmiyor, runtime'da set ediyoruz.
+    # --no-daemon SART (03_11): daemon'lu 'ros2 param set' arkasinda kalici bir ros2
+    # daemon (python3, ~16 thread) birakiyor; daemon SIGTERM'i yutuyor ve servis
+    # durdurulunca cgroup'ta tek kalip systemd'nin 15 s TimeoutStopSec'ini doldurup
+    # SIGKILL yiyordu (her stop 15 s; otopilot KAPAT'inda kapanis ~20 s). Masada
+    # dogrulandi: daemon SIGTERM sonrasi 6 s yasiyor; --no-daemon hic baslatmiyor.
     disable_emitter = ExecuteProcess(
-        cmd=['ros2', 'param', 'set',
+        cmd=['ros2', 'param', 'set', '--no-daemon', '--spin-time', '3',
              '/camera/camera',
              'depth_module.emitter_enabled', '0'],
         output='screen',
