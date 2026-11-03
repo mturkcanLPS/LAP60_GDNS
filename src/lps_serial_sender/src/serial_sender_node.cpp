@@ -687,6 +687,9 @@ public:
         dual_fusion_     = declare_parameter<bool>("dual_camera_fusion", true);
         tag_pair_tol_m_  = (float)declare_parameter<double>("tag_pair_tol_m", 0.30);   // tutarsizsa infra1
         tag_fresh_ms_    = (uint32_t)declare_parameter<int>("tag_fresh_ms", 200);      // 15 Hz x3
+        // Iki tag sonucu ancak cekim zamanlari bu kadar yakinsa (ayni kare; 30 fps'te kare
+        // 33 ms) ortalanir; degilse yeni olan gider.
+        tag_sync_s_      = declare_parameter<double>("tag_pair_sync_ms", 10.0) / 1000.0;
         flow_fresh_ms_   = (uint32_t)declare_parameter<int>("flow_fresh_ms", 100);     // 30 Hz x3
         flow_agree_px_   = (float)declare_parameter<double>("flow_agree_px", 1.0);
         flow_agree_frac_ = (float)declare_parameter<double>("flow_agree_frac", 0.3);
@@ -815,6 +818,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(data_mutex_);
             apriltag_     = ap;
+            tag1_cap_s_   = lps::stampSeconds(msg->header.stamp);   // kamera cekim ani
             tag_overlays_ = std::move(overlays);
         }
     }
@@ -830,7 +834,8 @@ private:
         apriltagPack_t ap = packFromFusion(f, msSinceStart());
         subtractCamOffset(ap, cam_off2_);   // -> platform merkezine gore (aprtiltag2 de)
         std::lock_guard<std::mutex> lk(data_mutex_);
-        apriltag2_ = ap;
+        apriltag2_  = ap;
+        tag2_cap_s_ = lps::stampSeconds(msg->header.stamp);
     }
 
     /* -------------------------------------------------------------- */
@@ -1226,6 +1231,7 @@ private:
         }
 
         apriltagPack_t  at_copy, at2_copy;
+        double          cap1 = 0, cap2 = 0;   // tag sonuclarinin kamera cekim anlari (s)
         carPack_t       car_copy;
         healthPack_t    health_copy;
         int8_t          cpu_real_copy;
@@ -1236,6 +1242,7 @@ private:
             std::lock_guard<std::mutex> lk(data_mutex_);
             at_copy = apriltag_; of_copy = opticflow_; ir_copy = ir_data_;
             at2_copy = apriltag2_; of2_copy = opticflow2_;
+            cap1 = tag1_cap_s_; cap2 = tag2_cap_s_;
             car_copy = car_;
             health_copy = health_pack_;
             cpu_real_copy = health_cpu_real_;
@@ -1251,9 +1258,14 @@ private:
             const auto fresh = [now_ms](uint32_t ts, uint32_t lim) {
                 return ts != 0 && now_ms - ts <= lim;
             };
-            const lps::TagPairResult tr = lps::fuseTagPair(
-                tagSample(at_copy,  fresh(at_copy.timeStamp,  tag_fresh_ms_)),
-                tagSample(at2_copy, fresh(at2_copy.timeStamp, tag_fresh_ms_)), tag_pair_tol_m_);
+            lps::TagSample s1 = tagSample(at_copy,  fresh(at_copy.timeStamp,  tag_fresh_ms_));
+            lps::TagSample s2 = tagSample(at2_copy, fresh(at2_copy.timeStamp, tag_fresh_ms_));
+            // Sadece AYNI kareden gelen iki sonuc ortalanir; farkli karelerse yenisi gider.
+            if (s1.ok && s2.ok) {
+                ++fus_tag_both_;
+                if (!lps::keepSameFrame(s1, cap1, s2, cap2, tag_sync_s_)) ++fus_tag_sync_;
+            }
+            const lps::TagPairResult tr = lps::fuseTagPair(s1, s2, tag_pair_tol_m_);
             if (tr.src) {
                 const uint32_t ts = tr.src == 1 ? at_copy.timeStamp : tr.src == 2 ? at2_copy.timeStamp
                                   : std::max(at_copy.timeStamp, at2_copy.timeStamp);
@@ -1439,15 +1451,17 @@ private:
                     const auto &ft = pkt.pack.variables.aprtiltag.avgPos;
                     const auto &ff = pkt.pack.variables.opticflow;
                     RCLCPP_INFO(get_logger(),
-                        "[FUSION]    tag: ikisi %%%d infra1 %%%d infra2 %%%d yok %%%d fark %.3f m"
+                        "[FUSION]    tag: ikisi %%%d infra1 %%%d infra2 %%%d yok %%%d fark %.3f m esli kare %u/%u"
                         " | akis: ikisi %%%d infra1 %%%d infra2 %%%d yok %%%d"
                         " | pakette pos(%.3f,%.3f,%.3f) akis(%.3f,%.3f) Q%u",
                         pct(fus_tag_cnt_, 3), pct(fus_tag_cnt_, 1), pct(fus_tag_cnt_, 2), pct(fus_tag_cnt_, 0),
                         fus_tag_diff_n_ ? fus_tag_diff_sum_ / fus_tag_diff_n_ : -1.0,
+                        fus_tag_sync_, fus_tag_both_,
                         pct(fus_flow_cnt_, 3), pct(fus_flow_cnt_, 1), pct(fus_flow_cnt_, 2), pct(fus_flow_cnt_, 0),
                         ft.pos.x, ft.pos.y, ft.pos.z, ff.motionPos.x, ff.motionPos.y, ff.quality);
                     for (int i = 0; i < 4; ++i) fus_tag_cnt_[i] = fus_flow_cnt_[i] = 0;
                     fus_tag_diff_sum_ = 0; fus_tag_diff_n_ = 0;
+                    fus_tag_both_ = fus_tag_sync_ = 0;
                 }
                 // Arac: pakete GIDEN kopya (bayatlik kontrolu uygulanmis hali)
                 RCLCPP_INFO(get_logger(),
@@ -1887,6 +1901,9 @@ private:
     uint32_t tag_fresh_ms_ = 200, flow_fresh_ms_ = 100;
     uint32_t fus_tag_cnt_[4] = {0, 0, 0, 0}, fus_flow_cnt_[4] = {0, 0, 0, 0};   // [yok,1,2,ikisi]
     double   fus_tag_diff_sum_ = 0; uint32_t fus_tag_diff_n_ = 0;
+    uint32_t fus_tag_both_ = 0, fus_tag_sync_ = 0;   // ikisi gecerli / bunlarin ayni kareden olani
+    double   tag_sync_s_ = 0.010;
+    double   tag1_cap_s_ = 0, tag2_cap_s_ = 0;       // son tag sonuclarinin cekim ani (data_mutex_)
 
     /* Arac bearing'i (car_detector -> car) */
     carPack_t   car_{};                 // carCb yazar, TX okur (data_mutex_)

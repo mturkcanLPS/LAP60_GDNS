@@ -41,6 +41,17 @@ inline float circMeanDeg(float a, float b)
                               std::cos(a * r) + std::cos(b * r)) / r);
 }
 
+/** Iki sonuc AYNI kareden mi? Kamera cekim zamanlari (header.stamp; infra1/infra2 donanim
+ *  senkron) sync_s'den fazla farkliysa ESKISINI birakir: farkli anlardaki iki konumun
+ *  ortalamasi hareket halinde ikisinin arasina duser (1 m/s'de kare basina ~3 cm).
+ *  Birakildiysa true. */
+inline bool keepSameFrame(TagSample &a, double ta, TagSample &b, double tb, double sync_s)
+{
+    if (!(a.ok && b.ok) || std::fabs(ta - tb) <= sync_s) return false;
+    (ta >= tb ? b : a).ok = false;
+    return true;
+}
+
 /** Ikisi de gecerli ve tol_m icinde tutarliysa ortalama (bitler OR); tutarsizsa infra1
  *  (birincil kamera; IR ucgeni de orada). Biri gecerliyse o. */
 inline TagPairResult fuseTagPair(const TagSample &a, const TagSample &b, float tol_m)

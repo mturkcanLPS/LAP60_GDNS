@@ -49,6 +49,20 @@ int main()
         r = fuseTagPair(c, d, 0.30f);
         CHECK(near(std::fabs(r.out.yaw), 180, 1e-3), "yaw +-179 -> 180 (0 degil)");
     }
+    std::printf("tag: ayni kare mi (cekim zamani)\n");
+    {
+        TagSample a; a.ok = true; a.x = 1.00f; TagSample b; b.ok = true; b.x = 1.03f;
+        bool d = keepSameFrame(a, 10.000, b, 10.002, 0.010);
+        CHECK(!d && a.ok && b.ok, "2 ms fark -> ayni kare, ikisi kalir");
+        d = keepSameFrame(a, 10.000, b, 10.033, 0.010);
+        CHECK(d && !a.ok && b.ok, "33 ms fark -> eski (infra1) birakilir, yeni (infra2) kalir");
+        a.ok = true; b.ok = true;
+        d = keepSameFrame(a, 10.067, b, 10.033, 0.010);
+        CHECK(d && a.ok && !b.ok, "infra1 daha yeni -> infra2 birakilir");
+        a.ok = true; b.ok = false;
+        d = keepSameFrame(a, 10.000, b, 10.500, 0.010);
+        CHECK(!d && a.ok, "biri zaten gecersiz -> dokunma");
+    }
     std::printf("akis\n");
     {
         FlowSample a{true, 1.0f, 2.0f, 80}, b{true, 1.2f, 2.1f, 40};
