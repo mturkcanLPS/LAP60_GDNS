@@ -104,13 +104,18 @@ journalctl -u apriltag_bringup -f           # canlı log
 
 | Argüman | Varsayılan | Açıklama |
 |---|---|---|
-| `car_model` | `736x1280` | Araç modeli giriş boyutu: `640 \| 960 \| 736x1280 \| 1280`. Bilinmeyen değer 640'a düşer. |
+| `car_model` | `736x1280` | Yüksek irtifa (EO kamera) modeli: `640 \| 960 \| 736x1280 \| 1280`. Bilinmeyen değer 640'a düşer. |
+| `car_dual` | `true` | İki kamera: yüksekte EO + `car_model`, alçakta IR (infra1) + `car_model_low`. `false`: sadece EO. |
+| `car_model_low` | `640` | Alçak irtifa (IR) modeli |
+| `car_switch_down_m` / `car_switch_up_m` | `12` / `18` | Alçalırken bu irtifanın altında IR'ye, yükselirken üstünde EO'ya geçer. Arada iki model de çalışır, geçiş ~1 kare. |
 | `enable_car` | `true` | Araç tespitini aç/kapa |
 | `car_record` | `true` | EO debug videosu |
 | `apriltag_backend` | `cpu` | `cpu` (libapriltag) veya `gpu` (Isaac ROS) |
 | `serial_port` | `/dev/ttyTHS1` | Otopilot portu. Masa testinde sahte port (pty) verilir. |
 
 Servisi durdurup elle çalıştırmak için: `ros2 launch lps_bringup bringup.launch.py car_model:=640`.
+
+**İki kamerayla araç tespiti:** EO + büyük model ~11 m altında aracı kaçırıyor ve renkli kameranın görüş alanı 5 m'de aracı sığdırmıyor. Alçakta IR kamera (87°×58°) + 640 model kullanılır; kayıtlarda 3–25 m arası %95–100 buldu. Bearing her durumda **renkli kamera çerçevesinde** gönderilir: IR'den gelen RealSense kalibrasyonuyla çevrilir. Bantta iki kanal da kilit tutar, `[BANT]` log satırı ikisinin bearing farkını yazar. EO videosu o an aktif kanalı gösterir (üst bantta `[EO]` ya da `[IR]`).
 
 **Araç boy filtresi:** serial_sender her yeni radar karesinde irtifayı `/hrvs/altitude`'a yayınlar. car_detector kutunun uzun kenarını bu irtifayla metreye çevirir ve 2.5–9 m dışındaki adayları kilitlemeden eler (örneğin yerdeki ~1 m'lik tag levhası). Son irtifa 1.5 s'den eskiyse filtre kapanır. EO kaydında elenen kutular kırmızı çizilir ve yanlarında `L=…m` yazar. Kutu görüntü kenarına değiyorsa (araç kesik) alt sınır yerine kenara paralel boyutun en az 1.2 m olması aranır. Parametreler: `size_filter_enable`, `car_len_min_m`, `car_len_max_m`, `car_width_min_m`, `altitude_stale_s`.
 

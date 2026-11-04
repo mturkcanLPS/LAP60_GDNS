@@ -6,15 +6,23 @@
 // DeepStream C sample app yapisi (test1/appsrc-test) + gomulu rclcpp.
 // Girdi:  ROS2 Image (RealSense COLOR onerilir; model RGB bekliyor) -> appsrc
 // Cikti:  geometry_msgs/Vector3Stamped  '/car_detection/bearing'
-//           vector.x = X/Z, vector.y = Y/Z  (distortion-duzeltilmis yon, kamera cerc.)
+//           vector.x = X/Z, vector.y = Y/Z  (distortion-duzeltilmis yon, RENKLI kamera cerc.)
 //           vector.z = kilitli track_id (>=0 gecerli; <0 => kilit yok)
 //         Otopilot: yon(x,y) + kendi lazer irtifasi -> metrik ofset. Biz metrik URETMIYORUZ.
+//
+// IKI KAMERA (03_11, dual_camera:=true): yuksekte EO + buyuk model (736x1280, uzak menzil),
+// alcakta infra1 + 640 model. EO'da 1280 giris ~11 m altinda araci kaciriyor ve 70x43 derece
+// gorus 5 m'de araci sigdirmiyor; IR 87x58 derece + 640 giris kayitta 3-25 m'de %95-100
+// buldu. Gecis HRVS irtifasiyla, histerezisli: alcalirken switch_down_m'de IR'ye, yukselirken
+// switch_up_m'de EO'ya. Bant icinde IKI hat da beslenir ve kilit tutar -> gecis bir kare,
+// yeni kanal araci zaten kilitlemis. IR bearing'i RealSense extrinsics'iyle RENKLI kamera
+// cercevesine cevrilir -> otopilot tarafi degismez. Irtifa yoksa (alt_lost_s) eski davranis: EO.
 //
 // Guvenlik (tracker ustunde asil emniyet):
 //   YAKALAMA merkeze en yakin araci kilitle | TAKIP kilitli ID | GATE ani sicramayi reddet
 //   YENIDEN-KILIT ID kaybolursa son-pozisyona en yakin & gate-ici | KAYIP N frame -> birak
 //
-// Pipeline:
+// Pipeline (kanal basina):
 //   appsrc(RGBA) -> queue(leaky) -> nvvideoconvert -> NVMM/NV12 -> nvstreammux
 //     -> nvinfer(config) -> nvtracker(NvDCF) -> fakesink   [probe: tracker src pad]
 //
@@ -30,6 +38,7 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/range.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <realsense2_camera_msgs/msg/extrinsics.hpp>
 
 #include <opencv2/opencv.hpp>
 
@@ -52,8 +61,10 @@
 #include <cstring>
 #include <filesystem>
 
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -109,15 +120,74 @@ class CarDetector : public rclcpp::Node {
     double alt = -1;         // boy filtresinin kullandigi HRVS irtifasi; <0: filtre kapali
   };
 
+  enum { EO = 0, IR = 1 };
+
+  // Bir tespit kanali: kamera + model + DeepStream hatti + kilit durumu.
+  struct Chan {
+    CarDetector *self = nullptr;
+    int idx = EO;
+    const char *name = "EO";
+    std::string image_topic, cinfo_topic, nvinfer_cfg;
+    int frame_skip = 1;                    // IR 30 fps -> her 2. kare (15 fps)
+    uint64_t n_rx = 0;                     // yalniz executor thread'i
+    GstElement *pipeline = nullptr, *appsrc = nullptr, *pgie = nullptr, *tracker = nullptr;
+    std::atomic<bool> fed{false};          // su an besleniyor mu
+    std::atomic<bool> reset_req{false};    // beslenmeye yeniden baslarken kilidi sifirla
+    std::atomic<int64_t> last_in_ns{0}, last_out_ns{0};   // steady ns; out 0 = henuz cikti yok
+    // intrinsics (mux boyutuna olcekli)
+    std::mutex k_mtx;
+    cv::Mat K, D;
+    bool have_K = false;
+    // son kare zaman damgasi
+    std::mutex stamp_mtx;
+    builtin_interfaces::msg::Time last_stamp;
+    // kilit durumu (yalniz bu kanalin probe thread'inden erisilir)
+    long locked_id = -1;
+    double last_u = 0, last_v = 0;
+    double vel_u = 0, vel_v = 0;           // piksel/kare hiz tahmini (pan takibi)
+    bool have_last = false;
+    int lost = 0;
+    // son hesaplanan bearing (overlay/OSD icin; IR'de renkli cerceveye cevrilmis)
+    double pub_bx = 0, pub_by = 0, pub_u = 0, pub_v = 0, pub_conf = 0;
+    bool pub_valid = false;
+    // kayit overlay'i (probe yazar, onImage okur)
+    std::mutex rec_ov_mtx;
+    RecOverlay rec_ov;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_ci;
+  };
+
 public:
   CarDetector() : Node("car_detector") {
+    for (int i = 0; i < 2; ++i) {
+      ch_[i] = std::make_unique<Chan>();
+      ch_[i]->self = this; ch_[i]->idx = i; ch_[i]->name = i == EO ? "EO" : "IR";
+    }
+    Chan &eo = *ch_[EO], &ir = *ch_[IR];
     // ---- parametreler ----
-    image_topic_  = declare_parameter<std::string>("image_topic",
+    eo.image_topic = declare_parameter<std::string>("image_topic",
                         "/camera/camera/color/image_raw");
-    cinfo_topic_  = declare_parameter<std::string>("camera_info_topic",
+    eo.cinfo_topic = declare_parameter<std::string>("camera_info_topic",
                         "/camera/camera/color/camera_info");
-    nvinfer_cfg_  = declare_parameter<std::string>("nvinfer_config",
+    eo.nvinfer_cfg = declare_parameter<std::string>("nvinfer_config",
                         "/home/lapis/DeepStream-Yolo/config_infer_primary_yoloV8.txt");
+    // Iki kamera (bkz. dosya basi). Kapaliyken davranis eskisiyle birebir (sadece EO).
+    dual_          = declare_parameter<bool>("dual_camera", false);
+    ir.image_topic = declare_parameter<std::string>("ir_image_topic",
+                        "/camera/camera/infra1/image_rect_raw");
+    ir.cinfo_topic = declare_parameter<std::string>("ir_camera_info_topic",
+                        "/camera/camera/infra1/camera_info");
+    ir.nvinfer_cfg = declare_parameter<std::string>("ir_nvinfer_config", "");
+    ir.frame_skip  = std::max(1, (int)declare_parameter<int>("ir_frame_skip", 2));
+    down_m_        = declare_parameter<double>("switch_down_m", 12.0);  // alcalirken IR'ye
+    up_m_          = declare_parameter<double>("switch_up_m", 18.0);    // yukselirken EO'ya
+    alt_lost_s_    = declare_parameter<double>("altitude_lost_s", 10.0); // bu kadar irtifa yok -> EO
+    ext_topic_     = declare_parameter<std::string>("ir_to_color_extrinsics_topic",
+                        "/camera/camera/extrinsics/depth_to_color");   // D4xx: depth = infra1
+    if (dual_ && ir.nvinfer_cfg.empty()) {
+      RCLCPP_ERROR(get_logger(), "dual_camera=true ama ir_nvinfer_config bos -> sadece EO");
+      dual_ = false;
+    }
     tracker_cfg_  = declare_parameter<std::string>("tracker_config", DS_TRACKER_CFG);
     // deepstream-test2 tarzi [tracker] keyfile (elle duzenlenebilir, recompile yok).
     // Bos -> paketin share/config/tracker_config.txt'si; o da yoksa hardcoded perf.
@@ -156,7 +226,7 @@ public:
     // ---- dayaniklilik (bkz. dosya basi) ----
     // nvvideoconvert yuzey kopyasi donanimi: 0 = eleman varsayilani (GPU), 1 = GPU, 2 = VIC.
     copy_hw_         = declare_parameter<int>("copy_hw", 0);
-    // RSS bunu asarsa kapan (normal ~560 MB). 0 = kapali.
+    // RSS bunu asarsa kapan (normal ~560 MB tek model). 0 = kapali.
     max_rss_mb_      = declare_parameter<int>("max_rss_mb", 1500);
     // Kareler geliyor ama pipeline bu kadar sn cikti vermiyorsa takildi say. 0 = kapali.
     // Ilk cikti gelene kadar devre disi (motor ilk derlemesi dakikalar surer).
@@ -175,6 +245,7 @@ public:
     // Olcum (#42 Egea 4.53 m, 16-64 m): 3.7-6.3 m cikti; levha 1.0 m. Hilux 5.32 m
     // ayni oranla ~4.3-7.4 m. Uzun kenar arac donse de ~boy kalir (en-boy orani degil).
     // HRVS bayatsa (radar donmus/kopuk) ya da intrinsics yoksa filtre KAPALI (eski davranis).
+    // Kanal basina KENDI kamerasinin intrinsics'iyle hesaplanir.
     size_filter_   = declare_parameter<bool>("size_filter_enable", true);
     len_min_m_     = declare_parameter<double>("car_len_min_m", 2.5);
     len_max_m_     = declare_parameter<double>("car_len_max_m", 9.0);
@@ -183,16 +254,16 @@ public:
     wid_min_m_     = declare_parameter<double>("car_width_min_m", 1.2);   // kesik kutuda paralel boyut alt siniri
     alt_topic_     = declare_parameter<std::string>("altitude_topic", "/hrvs/altitude");
 
-    // intrinsics: param > 0 ise onu kullan, degilse camera_info bekle
+    // EO intrinsics: param > 0 ise onu kullan, degilse camera_info bekle
     double fx = declare_parameter<double>("fx", 0.0);
     double fy = declare_parameter<double>("fy", 0.0);
     double cx = declare_parameter<double>("cx", 0.0);
     double cy = declare_parameter<double>("cy", 0.0);
     if (fx > 0 && fy > 0) {
-      std::lock_guard<std::mutex> lk(k_mtx_);
-      K_ = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
-      D_ = cv::Mat::zeros(1, 5, CV_64F);
-      have_K_ = true;
+      std::lock_guard<std::mutex> lk(eo.k_mtx);
+      eo.K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+      eo.D = cv::Mat::zeros(1, 5, CV_64F);
+      eo.have_K = true;
       RCLCPP_INFO(get_logger(), "Intrinsics param: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
                   fx, fy, cx, cy);
     } else {
@@ -205,9 +276,14 @@ public:
     reacq_gate_px_ = reacq_gate_frac_ * diag;
 
     // nvdsosd overlay'i SADECE display modunda (ekran). Kayit OpenCV'de kendi
-    // overlay'ini cizer, nvdsosd'ye ihtiyac yok.
+    // overlay'ini cizer, nvdsosd'ye ihtiyac yok. Ekran modu sadece EO (tek kanal).
     osd_active_ = display_;
+    if (display_ && dual_) {
+      RCLCPP_WARN(get_logger(), "display=true -> dual_camera kapatildi (ekran sadece EO)");
+      dual_ = false;
+    }
     // Kayit oturum numarasi (launch verir) -> eo_sNNNN_YYYYmmdd_HHMMSS[_k].avi
+    // Iki kamerada video AKTIF kanali gosterir (alcakta IR goruntusu, ust bantta KAYNAK).
     const int record_session = declare_parameter<int>("record_session", 0);
     if (record_video_ && !display_)   // ekran yoksa dosyaya kaydet (IR gibi .avi/MJPG)
       record_path_ = claimRecordPath(record_dir_, "eo", record_session, "avi");
@@ -216,30 +292,57 @@ public:
     pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
         "/car_detection/bearing", 10);
     auto qos = rclcpp::SensorDataQoS();
-    sub_img_ = create_subscription<sensor_msgs::msg::Image>(
-        image_topic_, qos,
-        std::bind(&CarDetector::onImage, this, std::placeholders::_1));
-    sub_ci_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-        cinfo_topic_, qos,
-        std::bind(&CarDetector::onCameraInfo, this, std::placeholders::_1));
+    const int nch = dual_ ? 2 : 1;
+    for (int i = 0; i < nch; ++i) {
+      Chan *c = ch_[i].get();
+      c->sub_img = create_subscription<sensor_msgs::msg::Image>(
+          c->image_topic, qos,
+          [this, c](const sensor_msgs::msg::Image::SharedPtr m) { onImage(m, *c); });
+      c->sub_ci = create_subscription<sensor_msgs::msg::CameraInfo>(
+          c->cinfo_topic, qos,
+          [this, c](const sensor_msgs::msg::CameraInfo::SharedPtr m) { onCameraInfo(m, *c); });
+    }
     // serial_sender her YENI radar karesinde yayinlar; radar donarsa mesaj kesilir.
     sub_alt_ = create_subscription<sensor_msgs::msg::Range>(
         alt_topic_, qos, [this](const sensor_msgs::msg::Range::SharedPtr m) {
           alt_m_.store(m->range);
           alt_ns_.store(nowNs());
+          updateMode();
         });
+    if (dual_) {
+      // RealSense extrinsics'i bir kez (latched) yayinlar -> transient_local ile al.
+      sub_ext_ = create_subscription<realsense2_camera_msgs::msg::Extrinsics>(
+          ext_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+          [this](const realsense2_camera_msgs::msg::Extrinsics::SharedPtr m) { onExtrinsics(m); });
+    }
 
-    buildPipeline();
+    gst_init(nullptr, nullptr);
+    for (int i = 0; i < nch; ++i) buildPipeline(*ch_[i]);
+    // bus watch icin GMainLoop (ayri thread, iki hattin bus'i da burada)
+    loop_ = g_main_loop_new(nullptr, FALSE);
+    gthread_ = std::thread([this]() { g_main_loop_run(loop_); });
+    t_start_ = std::chrono::steady_clock::now();
+    updateMode();   // irtifa gelene kadar: EO (eski davranis)
 
     // Bekci: onImage ile ayni executor thread'inde -> writer_'a guvenle dokunur.
-    guard_timer_ = create_wall_timer(std::chrono::milliseconds(250), [this]() { guard(); });
+    guard_timer_ = create_wall_timer(std::chrono::milliseconds(250), [this]() {
+      updateMode();   // irtifa bayatlamasi (mesaj gelmezse altitude callback'i calismaz)
+      logBandDiff();
+      guard();
+    });
 
     RCLCPP_INFO(get_logger(),
         "car_detector hazir | in='%s' mux=%dx%d track_gate=%.0f reacq_gate=%.0f conf>=%.2f"
         " | copy_hw=%d max_rss=%dMB stall=%.1fs | boy filtresi %s %.1f-%.1f m (irtifa '%s', bayat>%.1fs)",
-        image_topic_.c_str(), W_, H_, track_gate_px_, reacq_gate_px_, conf_th_,
+        eo.image_topic.c_str(), W_, H_, track_gate_px_, reacq_gate_px_, conf_th_,
         copy_hw_, max_rss_mb_, stall_timeout_s_,
         size_filter_ ? "ACIK" : "KAPALI", len_min_m_, len_max_m_, alt_topic_.c_str(), alt_stale_s_);
+    if (dual_)
+      RCLCPP_INFO(get_logger(),
+          "IKI KAMERA: yuksek=EO '%s' | alcak=IR '%s' (her %d. kare) model '%s' | "
+          "alcalirken <%.1f m IR, yukselirken >%.1f m EO, irtifa %.0f s yoksa EO",
+          eo.nvinfer_cfg.c_str(), ir.image_topic.c_str(), ir.frame_skip, ir.nvinfer_cfg.c_str(),
+          down_m_, up_m_, alt_lost_s_);
     if (test_fail_after_s_ > 0)
       RCLCPP_WARN(get_logger(), "TEST: %.0f sn sonra %s pipeline hatasi enjekte edilecek",
                   test_fail_after_s_, test_fail_silent_ ? "SESSIZ" : "bus ERROR'lu");
@@ -247,9 +350,11 @@ public:
 
   ~CarDetector() override {
     if (writer_open_) writer_.release();   // .avi index'ini yaz (temiz kapanis)
-    if (pipeline_) {
-      gst_element_set_state(pipeline_, GST_STATE_NULL);
-      gst_object_unref(pipeline_);
+    for (auto &c : ch_) {
+      if (c && c->pipeline) {
+        gst_element_set_state(c->pipeline, GST_STATE_NULL);
+        gst_object_unref(c->pipeline);
+      }
     }
     if (loop_) { g_main_loop_quit(loop_); }
     if (gthread_.joinable()) gthread_.join();
@@ -257,40 +362,42 @@ public:
 
 private:
   // ==========================================================================
-  //  Pipeline kurulumu
+  //  Pipeline kurulumu (kanal basina)
   // ==========================================================================
-  void buildPipeline() {
-    // nvinfer config GORELI yollar kullaniyor (onnx/custom-lib/labels) ->
-    // config klasorune chdir et ki hangi dizinden calisirsak calisalim bulunsun.
-    gchar *cfg_dir = g_path_get_dirname(nvinfer_cfg_.c_str());
+  void buildPipeline(Chan &c) {
+    // nvinfer config GORELI yollar kullaniyor (onnx/labels) -> config klasorune chdir et.
+    // Model hat PLAYING'e gecerken yuklenir; iki kanalda SIRAYLA kurulur ve her biri
+    // kendi klasorunde yuklenene kadar beklenir (cwd sureç geneli).
+    gchar *cfg_dir = g_path_get_dirname(c.nvinfer_cfg.c_str());
     if (chdir(cfg_dir) != 0)
-      RCLCPP_WARN(get_logger(), "chdir('%s') basarisiz -> goreli yollar patlayabilir",
-                  cfg_dir);
+      RCLCPP_WARN(get_logger(), "[%s] chdir('%s') basarisiz -> goreli yollar patlayabilir",
+                  c.name, cfg_dir);
     else
-      RCLCPP_INFO(get_logger(), "cwd -> %s (nvinfer goreli yollari icin)", cfg_dir);
+      RCLCPP_INFO(get_logger(), "[%s] cwd -> %s (nvinfer goreli yollari icin)", c.name, cfg_dir);
     g_free(cfg_dir);
 
-    gst_init(nullptr, nullptr);
-    pipeline_ = gst_pipeline_new("car-det");
+    const std::string p = std::string(c.name);
+    c.pipeline = gst_pipeline_new(("car-det-" + p).c_str());
 
-    appsrc_        = mk("appsrc", "ros-src");
-    GstElement *q  = mk("queue", "src-q");
-    GstElement *cv = mk("nvvideoconvert", "nvconv");
-    GstElement *cf = mk("capsfilter", "nvmm-caps");
-    mux_           = mk("nvstreammux", "mux");
-    pgie_          = mk("nvinfer", "pgie");
-    tracker_       = mk("nvtracker", "tracker");
+    c.appsrc       = mk("appsrc", ("ros-src-" + p).c_str());
+    GstElement *q  = mk("queue", ("src-q-" + p).c_str());
+    GstElement *cv = mk("nvvideoconvert", ("nvconv-" + p).c_str());
+    GstElement *cf = mk("capsfilter", ("nvmm-caps-" + p).c_str());
+    GstElement *mux = mk("nvstreammux", ("mux-" + p).c_str());
+    c.pgie         = mk("nvinfer", ("pgie-" + p).c_str());
+    c.tracker      = mk("nvtracker", ("tracker-" + p).c_str());
 
     // appsrc: sistem bellekte RGBA besliyoruz
-    GstCaps *caps = gst_caps_from_string(
-        g_strdup_printf("video/x-raw,format=RGBA,width=%d,height=%d,framerate=30/1",
-                        W_, H_));
-    g_object_set(appsrc_, "caps", caps, "format", GST_FORMAT_TIME,
+    gchar *capstr = g_strdup_printf(
+        "video/x-raw,format=RGBA,width=%d,height=%d,framerate=30/1", W_, H_);
+    GstCaps *caps = gst_caps_from_string(capstr);
+    g_free(capstr);
+    g_object_set(c.appsrc, "caps", caps, "format", GST_FORMAT_TIME,
                  "is-live", TRUE, "do-timestamp", TRUE, "block", FALSE, nullptr);
     gst_caps_unref(caps);
     // Ic kuyruk SINIRLI: en fazla 2 kare, dolunca EN ESKIYI at. Sinirsizken pipeline
     // durunca (19_10 GPU hatasi) her kare (3.7 MB) birikip OOM'a goturdu.
-    g_object_set(appsrc_, "max-buffers", (guint64)2, "max-bytes", (guint64)0,
+    g_object_set(c.appsrc, "max-buffers", (guint64)2, "max-bytes", (guint64)0,
                  "max-time", (guint64)0, "leaky-type", GST_APP_LEAKY_TYPE_DOWNSTREAM, nullptr);
 
     g_object_set(q, "leaky", 2, "max-size-buffers", 3, nullptr);  // downstream leaky
@@ -300,20 +407,20 @@ private:
     g_object_set(cf, "caps", nvmm, nullptr);
     gst_caps_unref(nvmm);
 
-    g_object_set(mux_, "batch-size", 1, "width", W_, "height", H_,
+    g_object_set(mux, "batch-size", 1, "width", W_, "height", H_,
                  "live-source", 1, "batched-push-timeout", 40000, nullptr);
 
-    g_object_set(pgie_, "config-file-path", nvinfer_cfg_.c_str(), nullptr);
-    if (pgie_interval_ > 0) g_object_set(pgie_, "interval", pgie_interval_, nullptr);
+    g_object_set(c.pgie, "config-file-path", c.nvinfer_cfg.c_str(), nullptr);
+    if (pgie_interval_ > 0) g_object_set(c.pgie, "interval", pgie_interval_, nullptr);
 
     // Tracker ayarlari: once keyfile (deepstream-test2 tarzi), olmazsa hardcoded perf.
     bool tok = false;
     if (!tracker_cfg_file_.empty())
-      tok = setTrackerProperties(tracker_, tracker_cfg_file_);
+      tok = setTrackerProperties(c.tracker, tracker_cfg_file_);
     if (!tok) {
       RCLCPP_WARN(get_logger(),
           "tracker keyfile yok/basarisiz -> hardcoded perf defaults");
-      g_object_set(tracker_,
+      g_object_set(c.tracker,
                    "ll-lib-file", DS_TRACKER_LIB,
                    "ll-config-file", tracker_cfg_.c_str(),
                    "tracker-width", 640, "tracker-height", 384, nullptr);
@@ -324,16 +431,16 @@ private:
     //   ROS topic'ten izlersin (ros2 topic echo /car_detection/bearing).
     // display=true: tracker -> nvvideoconvert -> nvdsosd -> nv3dsink -> EKRANDA
     //   kutular + track ID + kilitli arac vurgusu. (Jetson'a monitor/X gerekir.)
-    gst_bin_add_many(GST_BIN(pipeline_), appsrc_, q, cv, cf, mux_,
-                     pgie_, tracker_, nullptr);
+    gst_bin_add_many(GST_BIN(c.pipeline), c.appsrc, q, cv, cf, mux,
+                     c.pgie, c.tracker, nullptr);
 
     // appsrc -> q -> cv -> cf -> mux.sink_0
-    if (!gst_element_link_many(appsrc_, q, cv, cf, nullptr))
-      RCLCPP_FATAL(get_logger(), "appsrc..capsfilter link basarisiz");
-    GstPad *muxpad = gst_element_request_pad_simple(mux_, "sink_0");
+    if (!gst_element_link_many(c.appsrc, q, cv, cf, nullptr))
+      RCLCPP_FATAL(get_logger(), "[%s] appsrc..capsfilter link basarisiz", c.name);
+    GstPad *muxpad = gst_element_request_pad_simple(mux, "sink_0");
     GstPad *srcpad = gst_element_get_static_pad(cf, "src");
     if (gst_pad_link(srcpad, muxpad) != GST_PAD_LINK_OK)
-      RCLCPP_FATAL(get_logger(), "capsfilter -> mux link basarisiz");
+      RCLCPP_FATAL(get_logger(), "[%s] capsfilter -> mux link basarisiz", c.name);
     gst_object_unref(srcpad);
     gst_object_unref(muxpad);
 
@@ -343,43 +450,142 @@ private:
       GstElement *osd   = mk("nvdsosd", "osd");
       GstElement *sink  = mk("nv3dsink", "disp-sink");   // Jetson yerlesik ekran
       g_object_set(sink, "sync", FALSE, nullptr);
-      gst_bin_add_many(GST_BIN(pipeline_), oconv, osd, sink, nullptr);
-      if (!gst_element_link_many(mux_, pgie_, tracker_, oconv, osd, sink, nullptr))
+      gst_bin_add_many(GST_BIN(c.pipeline), oconv, osd, sink, nullptr);
+      if (!gst_element_link_many(mux, c.pgie, c.tracker, oconv, osd, sink, nullptr))
         RCLCPP_FATAL(get_logger(), "mux..nv3dsink link basarisiz");
     } else {
       // INFERENCE-ONLY: tracker -> fakesink. Kayit DeepStream'de DEGIL — IR gibi
       // OpenCV VideoWriter ile onImage'da yapiliyor (encode/mux zinciri yok,
       // kare kare yazar, crash'e dayanikli, serial_sender IR recorder mantigi).
-      GstElement *sink = mk("fakesink", "sink");
+      GstElement *sink = mk("fakesink", ("sink-" + p).c_str());
       g_object_set(sink, "sync", FALSE, "async", FALSE, nullptr);
-      gst_bin_add(GST_BIN(pipeline_), sink);
-      if (!gst_element_link_many(mux_, pgie_, tracker_, sink, nullptr))
-        RCLCPP_FATAL(get_logger(), "mux..fakesink link basarisiz");
-      if (record_video_)
+      gst_bin_add(GST_BIN(c.pipeline), sink);
+      if (!gst_element_link_many(mux, c.pgie, c.tracker, sink, nullptr))
+        RCLCPP_FATAL(get_logger(), "[%s] mux..fakesink link basarisiz", c.name);
+      if (record_video_ && c.idx == EO)
         RCLCPP_INFO(get_logger(), "EO kaydi (OpenCV/IR-tarzi) -> %s", record_path_.c_str());
     }
 
     // PROBE: tracker src pad -> object_id burada dolu
-    GstPad *tsrc = gst_element_get_static_pad(tracker_, "src");
-    gst_pad_add_probe(tsrc, GST_PAD_PROBE_TYPE_BUFFER, probeThunk, this, nullptr);
+    GstPad *tsrc = gst_element_get_static_pad(c.tracker, "src");
+    gst_pad_add_probe(tsrc, GST_PAD_PROBE_TYPE_BUFFER, probeThunk, &c, nullptr);
     gst_object_unref(tsrc);
 
-    if (test_fail_after_s_ > 0) {   // SADECE TEST: nvinfer girisinde akis hatasi
-      GstPad *psink = gst_element_get_static_pad(pgie_, "sink");
+    if (test_fail_after_s_ > 0 && c.idx == EO) {   // SADECE TEST: nvinfer girisinde akis hatasi
+      GstPad *psink = gst_element_get_static_pad(c.pgie, "sink");
       gst_pad_add_probe(psink, GST_PAD_PROBE_TYPE_BUFFER, failThunk, this, nullptr);
       gst_object_unref(psink);
     }
 
-    // bus watch icin GMainLoop (ayri thread)
-    GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline_));
+    GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(c.pipeline));
     gst_bus_add_watch(bus, busThunk, this);
     gst_object_unref(bus);
 
-    loop_ = g_main_loop_new(nullptr, FALSE);
-    gthread_ = std::thread([this]() { g_main_loop_run(loop_); });
+    gst_element_set_state(c.pipeline, GST_STATE_PLAYING);
+    // Model yuklenene kadar bekle (cwd bir sonraki kanalda degisecek).
+    GstState st;
+    gst_element_get_state(c.pipeline, &st, nullptr, 120 * GST_SECOND);
+  }
 
-    t_start_ = std::chrono::steady_clock::now();
-    gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+  // ==========================================================================
+  //  Iki kamera: aktif kanal secimi (03_11)
+  // ==========================================================================
+  // Aktif kanal bearing YAYINLAR; beslenen ama aktif olmayan kanal sadece kilidini tutar.
+  //   irtifa taze : alcalirken < down_m -> IR, yukselirken > up_m -> EO (histerezis).
+  //                 [down, up] bandinda IKISI de beslenir -> gecis aninda yeni kanal kilitli.
+  //   kisa bayat  : karari tut, sadece aktif beslenir (HRVS kesintisi 1-10 s goruldu).
+  //   uzun yok    : (altitude_lost_s) EO — iki kamera oncesi davranis.
+  void updateMode() {
+    if (!dual_) { setFed(*ch_[EO], true); return; }
+    std::lock_guard<std::mutex> lk(mode_mtx_);
+    const int64_t now = nowNs(), t = alt_ns_.load();
+    const double alt = alt_m_.load();
+    const bool fresh = t != 0 && now - t <= (int64_t)(alt_stale_s_ * 1e9) && alt > 0.05;
+    const bool lost  = t == 0 || now - t > (int64_t)(alt_lost_s_ * 1e9);
+    int act = active_.load();
+    bool feedEO, feedIR;
+    if (fresh) {
+      if (act == EO && alt < down_m_) act = IR;
+      else if (act == IR && alt > up_m_) act = EO;
+      feedEO = act == EO || alt > down_m_;
+      feedIR = act == IR || alt < up_m_;
+    } else if (lost) {
+      act = EO; feedEO = true; feedIR = false;
+    } else {
+      feedEO = act == EO; feedIR = act == IR;
+    }
+    if (act != active_.load()) {
+      RCLCPP_INFO(get_logger(), "KAYNAK %s -> %s (irtifa %s%.1f m) | yeni kanal kilit %s",
+                  ch_[active_.load()]->name, ch_[act]->name, fresh ? "" : "bayat/yok ",
+                  fresh ? alt : 0.0, ch_[act]->locked_id >= 0 ? "HAZIR" : "yok");
+      active_.store(act);
+    }
+    setFed(*ch_[EO], feedEO);
+    setFed(*ch_[IR], feedIR);
+  }
+
+  // Bant icinde iki kanal da kilitliyken (ikisi de renkli kamera cercevesinde) bearing
+  // farki: gecisteki sicramanin ve IR->renkli extrinsics'in sahada dogrulamasi. 2 s'de bir.
+  // Okumalar probe thread'lerinin yazdigi alanlar — sadece log, kucuk yaris zararsiz.
+  void logBandDiff() {
+    if (!dual_ || ++band_tick_ % 8 != 0) return;
+    const Chan &e = *ch_[EO], &i = *ch_[IR];
+    if (!(e.fed.load() && i.fed.load() && e.pub_valid && i.pub_valid)) return;
+    RCLCPP_INFO(get_logger(), "[BANT] aktif %s | EO bearing (%+.4f,%+.4f) IR->renkli (%+.4f,%+.4f) "
+                "fark (%+.4f,%+.4f) rad, irtifa %.1f m",
+                ch_[active_.load()]->name, e.pub_bx, e.pub_by, i.pub_bx, i.pub_by,
+                i.pub_bx - e.pub_bx, i.pub_by - e.pub_by, alt_m_.load());
+  }
+
+  void setFed(Chan &c, bool on) {
+    if (on && !c.fed.load()) {
+      c.reset_req.store(true);                 // eski kilit durumu bayat
+      // bekci: yeniden beslenince takilma sayaci sifirdan. Hic cikti vermemis kanala
+      // dokunma (0 = bekci kapali; ilk motor derlemesi dakikalar surebilir).
+      if (c.last_out_ns.load() > 0) c.last_out_ns.store(nowNs());
+    }
+    c.fed.store(on);
+  }
+
+  // RealSense depth_to_color extrinsics'i (D4xx'te depth cercevesi = infra1).
+  // p_color = R * p_ir + t, R sutun-oncelikli (librealsense rs2_extrinsics).
+  void onExtrinsics(const realsense2_camera_msgs::msg::Extrinsics::SharedPtr m) {
+    std::lock_guard<std::mutex> lk(ext_mtx_);
+    for (int i = 0; i < 9; ++i) ext_R_[i] = m->rotation[i];
+    for (int i = 0; i < 3; ++i) ext_t_[i] = m->translation[i];
+    const bool first = !have_ext_;
+    have_ext_ = true;
+    if (first) {
+      const double tr = ext_R_[0] + ext_R_[4] + ext_R_[8];
+      const double ang = std::acos(std::max(-1.0, std::min(1.0, (tr - 1.0) / 2.0))) * 180.0 / M_PI;
+      RCLCPP_INFO(get_logger(), "IR->renkli extrinsics alindi: t=(%.1f, %.1f, %.1f) mm, donme %.2f derece",
+                  ext_t_[0] * 1000, ext_t_[1] * 1000, ext_t_[2] * 1000, ang);
+    }
+  }
+
+  // IR (infra1) normalize yonunu renkli kamera cercevesine cevir. Yon icin derinlik
+  // gerekir: Z = irtifa (yoksa 10 m); kameralar ~1.5 cm aralikli -> Z hatasinin etkisi
+  // < 1 mrad. Extrinsics gelmediyse birim donusum (uyari bir kez).
+  void irToColor(double &bx, double &by) {
+    double R[9], t[3];
+    {
+      std::lock_guard<std::mutex> lk(ext_mtx_);
+      if (!have_ext_) {
+        if (!ext_warned_) {
+          ext_warned_ = true;
+          RCLCPP_WARN(get_logger(), "IR->renkli extrinsics yok ('%s') -> birim donusum "
+                      "(hata ~1.5 cm / Z, kucuk donme)", ext_topic_.c_str());
+        }
+        return;
+      }
+      std::memcpy(R, ext_R_, sizeof(R)); std::memcpy(t, ext_t_, sizeof(t));
+    }
+    const double alt = alt_m_.load();
+    const double Z = (alt_ns_.load() != 0 && alt > 0.3) ? alt : 10.0;
+    const double p[3] = {bx * Z, by * Z, Z};
+    double q[3];
+    for (int i = 0; i < 3; ++i) q[i] = R[i] * p[0] + R[3 + i] * p[1] + R[6 + i] * p[2] + t[i];
+    if (q[2] > 1e-6) { bx = q[0] / q[2]; by = q[1] / q[2]; }
   }
 
   // ==========================================================================
@@ -411,11 +617,17 @@ private:
       why = "GStreamer hatasi: " + fatal_reason_;
     } else if (max_rss_mb_ > 0 && (rss = rssMb()) > max_rss_mb_) {
       why = "RSS " + std::to_string(rss) + " MB > " + std::to_string(max_rss_mb_) + " MB";
-    } else if (stall_timeout_s_ > 0 && last_out_ns_.load() > 0 &&
-               now - last_in_ns_.load() < 1000000000LL &&
-               now - last_out_ns_.load() > (int64_t)(stall_timeout_s_ * 1e9)) {
-      why = "pipeline takildi: kareler geliyor ama " +
-            std::to_string((now - last_out_ns_.load()) / 1000000) + " ms'dir cikti yok";
+    } else if (stall_timeout_s_ > 0) {
+      for (auto &cp : ch_) {
+        Chan &c = *cp;
+        if (!c.fed.load() || c.last_out_ns.load() <= 0) continue;
+        if (now - c.last_in_ns.load() < 1000000000LL &&
+            now - c.last_out_ns.load() > (int64_t)(stall_timeout_s_ * 1e9)) {
+          why = std::string("[") + c.name + "] pipeline takildi: kareler geliyor ama " +
+                std::to_string((now - c.last_out_ns.load()) / 1000000) + " ms'dir cikti yok";
+          break;
+        }
+      }
     }
     if (why.empty()) return;
     RCLCPP_FATAL(get_logger(), "%s -> car_detector KAPANIYOR (launch yeniden baslatacak)",
@@ -432,7 +644,7 @@ private:
     if (el < self->test_fail_after_s_) return GST_PAD_PROBE_OK;
     if (!self->test_fail_posted_.exchange(true)) {
       if (!self->test_fail_silent_)   // ucustaki gibi: nvinfer ERROR post eder
-        GST_ELEMENT_ERROR(self->pgie_, STREAM, FAILED,
+        GST_ELEMENT_ERROR(self->ch_[EO]->pgie, STREAM, FAILED,
                           ("TEST: enjekte edilen Buffer conversion failed"), (nullptr));
       fprintf(stderr, "[car_detector] TEST: pipeline %s enjekte edildi (%.1f s)\n",
               self->test_fail_silent_ ? "DONMASI" : "hatasi", el);
@@ -519,7 +731,7 @@ private:
   // ==========================================================================
   //  ROS -> appsrc
   // ==========================================================================
-  void onCameraInfo(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+  void onCameraInfo(const sensor_msgs::msg::CameraInfo::SharedPtr msg, Chan &c) {
     if (msg->width == 0 || msg->height == 0) return;
     double sx = (double)W_ / msg->width;
     double sy = (double)H_ / msg->height;
@@ -531,16 +743,18 @@ private:
     if (msg->d.size() >= 4) D = cv::Mat(1, (int)msg->d.size(), CV_64F,
                                         (void *)msg->d.data()).clone();
     else                    D = cv::Mat::zeros(1, 5, CV_64F);
-    std::lock_guard<std::mutex> lk(k_mtx_);
-    K_ = K; D_ = D; have_K_ = true;
+    std::lock_guard<std::mutex> lk(c.k_mtx);
+    c.K = K; c.D = D; c.have_K = true;
   }
 
-  void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
-    last_in_ns_.store(nowNs());
+  void onImage(const sensor_msgs::msg::Image::SharedPtr msg, Chan &c) {
     if (fatal_.load()) return;   // pipeline olu: bekci birazdan surecten cikacak
+    if (!c.fed.load()) return;   // bu kanal su an kullanilmiyor (GPU/CPU harcama)
+    if (c.frame_skip > 1 && (c.n_rx++ % c.frame_skip) != 0) return;
+    c.last_in_ns.store(nowNs());
     {
-      std::lock_guard<std::mutex> lk(stamp_mtx_);
-      last_stamp_ = msg->header.stamp;
+      std::lock_guard<std::mutex> lk(c.stamp_mtx);
+      c.last_stamp = msg->header.stamp;
     }
     const int h = msg->height, w = msg->width;
     cv::Mat rgba;
@@ -573,17 +787,17 @@ private:
     // yoksa nvbufsurftransform yanlis kopyalayip cudaErrorIllegalAddress'e dusuyor.
     gst_buffer_add_video_meta(buf, GST_VIDEO_FRAME_FLAG_NONE,
                               GST_VIDEO_FORMAT_RGBA, (guint)W_, (guint)H_);
-    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buf); // sahiplik gecer
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(c.appsrc), buf); // sahiplik gecer
     if (ret != GST_FLOW_OK)
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "appsrc push: %d", ret);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[%s] appsrc push: %d", c.name, ret);
 
-    // ---- IR-tarzi OpenCV kayit: overlay ciz + VideoWriter'a yaz (kare kare) ----
-    if (record_video_ && !display_) recordFrame(rgba);
+    // ---- IR-tarzi OpenCV kayit: AKTIF kanalin goruntusu + overlay (kare kare) ----
+    if (record_video_ && !display_ && c.idx == active_.load()) recordFrame(rgba, c);
   }
 
   // Gelen kareyi overlay'leyip .avi'ye yaz (serial_sender DebugRecorder mantigi).
   // DeepStream encode/mux YOK -> kare kare yazilir, crash'te bile o ana kadari saglam.
-  void recordFrame(const cv::Mat &rgba) {
+  void recordFrame(const cv::Mat &rgba, Chan &c) {
     // Once kucult (4 kanalda), sonra kucuk karede renk donusumu: tam cozunurlukte
     // cvtColor + MJPG bu node'un CPU'sunun buyuk kismiydi.
     cv::Mat src;
@@ -594,8 +808,8 @@ private:
     cv::Mat bgr;
     cv::cvtColor(src, bgr, cv::COLOR_RGBA2BGR);
     RecOverlay ov;
-    { std::lock_guard<std::mutex> lk(rec_ov_mtx_); ov = rec_ov_; }
-    drawRecOverlay(bgr, ov, (float)record_scale_);
+    { std::lock_guard<std::mutex> lk(c.rec_ov_mtx); ov = c.rec_ov; }
+    drawRecOverlay(bgr, ov, (float)record_scale_, dual_ ? c.name : nullptr);
 
     if (!writer_open_) {   // ilk karede ac (gercek boyutla)
       int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
@@ -613,7 +827,7 @@ private:
   }
 
   // k: kayit olcegi — kutular mux (tam cozunurluk) koordinatinda, kareyle birlikte olceklenir
-  void drawRecOverlay(cv::Mat &img, const RecOverlay &ov, float k = 1.0f) {
+  void drawRecOverlay(cv::Mat &img, const RecOverlay &ov, float k, const char *src) {
     for (const auto &b : ov.boxes) {   // kilitli=yesil kalin, aday=turuncu, boyla elenen=kirmizi (BGR)
       cv::Scalar col = b.rejected ? cv::Scalar(0, 0, 255)
                      : b.locked   ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
@@ -631,15 +845,17 @@ private:
     // durum seridi (yari saydam koyu zemin + beyaz yazi)
     cv::Rect band(0, 0, img.cols, 46);
     img(band) *= 0.4;
-    char l1[96], l2[96] = {0};
+    char l1[112], l2[96] = {0};
+    char pre[16] = "";
+    if (src) snprintf(pre, sizeof(pre), "[%s] ", src);   // iki kamerada aktif kaynak
     if (ov.locked_id >= 0 && ov.valid)
-      snprintf(l1, sizeof(l1), "LOCK id=%ld  conf=%.2f", ov.locked_id, ov.conf);
+      snprintf(l1, sizeof(l1), "%sLOCK id=%ld  conf=%.2f", pre, ov.locked_id, ov.conf);
     else if (ov.locked_id >= 0 && ov.have_k)   // kilit tutuluyor, bu karede eslesme yok
-      snprintf(l1, sizeof(l1), "LOCK id=%ld  HOLD (bu karede yok)", ov.locked_id);
+      snprintf(l1, sizeof(l1), "%sLOCK id=%ld  HOLD (bu karede yok)", pre, ov.locked_id);
     else if (ov.locked_id >= 0)
-      snprintf(l1, sizeof(l1), "LOCK id=%ld  (intrinsics yok)", ov.locked_id);
+      snprintf(l1, sizeof(l1), "%sLOCK id=%ld  (intrinsics yok)", pre, ov.locked_id);
     else
-      snprintf(l1, sizeof(l1), "KILIT YOK");
+      snprintf(l1, sizeof(l1), "%sKILIT YOK", pre);
     if (ov.locked_id >= 0 && ov.valid)
       snprintf(l2, sizeof(l2), "px=(%.0f,%.0f)  bx=%.3f by=%.3f", ov.u, ov.v, ov.bx, ov.by);
     cv::putText(img, l1, cv::Point(10, 18), cv::FONT_HERSHEY_SIMPLEX, 0.55,
@@ -658,22 +874,27 @@ private:
   }
 
   // ==========================================================================
-  //  PROBE -> kilit/gate -> bearing
+  //  PROBE -> kilit/gate -> bearing (kanal basina, o hattin streaming thread'inde)
   // ==========================================================================
   static GstPadProbeReturn probeThunk(GstPad *, GstPadProbeInfo *info, gpointer u) {
-    return static_cast<CarDetector *>(u)->onProbe(info);
+    auto *c = static_cast<Chan *>(u);
+    return c->self->onProbe(info, *c);
   }
 
-  GstPadProbeReturn onProbe(GstPadProbeInfo *info) {
+  GstPadProbeReturn onProbe(GstPadProbeInfo *info, Chan &c) {
     GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
     if (!buf) return GST_PAD_PROBE_OK;
-    last_out_ns_.store(nowNs());   // bekci: pipeline cikti veriyor
+    c.last_out_ns.store(nowNs());   // bekci: pipeline cikti veriyor
+    if (c.reset_req.exchange(false)) {   // yeniden beslenmeye basladi: eski kilit bayat
+      c.locked_id = -1; c.have_last = false; c.lost = 0; c.vel_u = 0; c.vel_v = 0;
+      c.pub_valid = false;
+    }
     NvDsBatchMeta *batch = gst_buffer_get_nvds_batch_meta(buf);
     if (!batch) return GST_PAD_PROBE_OK;
 
     for (NvDsMetaList *lf = batch->frame_meta_list; lf; lf = lf->next) {
       auto *fm = reinterpret_cast<NvDsFrameMeta *>(lf->data);
-      const SizeGate g = sizeGate();
+      const SizeGate g = sizeGate(c);
       std::vector<Cand> cands, rejected;
       for (NvDsMetaList *lo = fm->obj_meta_list; lo; lo = lo->next) {
         auto *o = reinterpret_cast<NvDsObjectMeta *>(lo->data);
@@ -682,18 +903,18 @@ private:
           const auto &r = o->rect_params;
           double u = r.left + r.width * 0.5;
           double v = r.top + r.height * 0.5;
-          Cand c{(long)o->object_id, u, v, (float)o->confidence, o, carLength(g, r, u, v)};
-          if (g.on && !lengthOk(g, c.len_m, r, u, v)) rejected.push_back(c);
-          else                               cands.push_back(c);
+          Cand cd{(long)o->object_id, u, v, (float)o->confidence, o, carLength(g, r, u, v)};
+          if (g.on && !lengthOk(g, cd.len_m, r, u, v)) rejected.push_back(cd);
+          else                                cands.push_back(cd);
         }
       }
       if (!rejected.empty())
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-            "BOY: %zu aday elendi (ilki id=%ld L=%.2f m) | irtifa %.1f m, sinir %.1f-%.1f m",
-            rejected.size(), rejected[0].id, rejected[0].len_m, g.alt, len_min_m_, len_max_m_);
-      updateLock(cands);
-      if (osd_active_) annotate(batch, fm, cands);        // sadece display (nvdsosd)
-      if (record_video_ && !display_) buildRecOverlay(cands, rejected, g);  // OpenCV recorder icin
+            "[%s] BOY: %zu aday elendi (ilki id=%ld L=%.2f m) | irtifa %.1f m, sinir %.1f-%.1f m",
+            c.name, rejected.size(), rejected[0].id, rejected[0].len_m, g.alt, len_min_m_, len_max_m_);
+      updateLock(c, cands);
+      if (osd_active_) annotate(batch, fm, cands, c);      // sadece display (nvdsosd)
+      if (record_video_ && !display_) buildRecOverlay(c, cands, rejected, g);  // OpenCV recorder icin
     }
     return GST_PAD_PROBE_OK;
   }
@@ -704,16 +925,16 @@ private:
   struct SizeGate { bool on = false; double alt = -1, fx = 0, fy = 0, cx = 0, cy = 0; };
 
   // Filtre bu kare icin acik mi: HRVS taze (alt_stale_s icinde yeni kare) ve intrinsics var.
-  SizeGate sizeGate() {
+  SizeGate sizeGate(Chan &c) {
     SizeGate g;
     if (!size_filter_) return g;
     const int64_t t = alt_ns_.load();
     const double alt = alt_m_.load();
     if (t == 0 || nowNs() - t > (int64_t)(alt_stale_s_ * 1e9) || !(alt > 0.1)) return g;
-    std::lock_guard<std::mutex> lk(k_mtx_);
-    if (!have_K_) return g;
-    g.fx = K_.at<double>(0, 0); g.fy = K_.at<double>(1, 1);
-    g.cx = K_.at<double>(0, 2); g.cy = K_.at<double>(1, 2);
+    std::lock_guard<std::mutex> lk(c.k_mtx);
+    if (!c.have_K) return g;
+    g.fx = c.K.at<double>(0, 0); g.fy = c.K.at<double>(1, 1);
+    g.cx = c.K.at<double>(0, 2); g.cy = c.K.at<double>(1, 2);
     g.alt = alt; g.on = true;
     return g;
   }
@@ -748,28 +969,28 @@ private:
 
   // Probe'daki tespitleri OpenCV recorder icin snapshot'a al (onImage cizecek).
   // Boy filtresinin eledikleri de cizilir (kirmizi) — kayittan sinir ayari icin.
-  void buildRecOverlay(const std::vector<Cand> &cands, const std::vector<Cand> &rejected,
+  void buildRecOverlay(Chan &c, const std::vector<Cand> &cands, const std::vector<Cand> &rejected,
                        const SizeGate &g) {
     RecOverlay ov;
     ov.boxes.reserve(cands.size() + rejected.size());
-    for (const auto &c : cands) {
-      const auto &r = c.om->rect_params;
+    for (const auto &cd : cands) {
+      const auto &r = cd.om->rect_params;
       ov.boxes.push_back({(float)r.left, (float)r.top, (float)r.width, (float)r.height,
-                          c.id, c.conf, (locked_id_ >= 0 && c.id == locked_id_),
-                          (float)c.len_m, false});
+                          cd.id, cd.conf, (c.locked_id >= 0 && cd.id == c.locked_id),
+                          (float)cd.len_m, false});
     }
-    for (const auto &c : rejected) {
-      const auto &r = c.om->rect_params;
+    for (const auto &cd : rejected) {
+      const auto &r = cd.om->rect_params;
       ov.boxes.push_back({(float)r.left, (float)r.top, (float)r.width, (float)r.height,
-                          c.id, c.conf, false, (float)c.len_m, true});
+                          cd.id, cd.conf, false, (float)cd.len_m, true});
     }
     ov.alt = g.on ? g.alt : -1;
-    ov.locked_id = locked_id_;
-    ov.bx = pub_bx_; ov.by = pub_by_; ov.u = pub_u_; ov.v = pub_v_;
-    ov.conf = (float)pub_conf_; ov.valid = pub_valid_;
-    { std::lock_guard<std::mutex> lk(k_mtx_); ov.have_k = have_K_; }
-    std::lock_guard<std::mutex> lk(rec_ov_mtx_);
-    rec_ov_ = std::move(ov);
+    ov.locked_id = c.locked_id;
+    ov.bx = c.pub_bx; ov.by = c.pub_by; ov.u = c.pub_u; ov.v = c.pub_v;
+    ov.conf = (float)c.pub_conf; ov.valid = c.pub_valid;
+    { std::lock_guard<std::mutex> lk(c.k_mtx); ov.have_k = c.have_K; }
+    std::lock_guard<std::mutex> lk(c.rec_ov_mtx);
+    c.rec_ov = std::move(ov);
   }
 
   // OSD/kayit overlay'i icin tek metin etiketi doldur
@@ -789,164 +1010,170 @@ private:
   // Kutu renkleri (kilitli=yesil kalin, aday=turuncu) + metinler:
   //  satir1: LOCK id + conf | satir2: olculen piksel + bearing | her kutuda id:conf
   void annotate(NvDsBatchMeta *batch, NvDsFrameMeta *fm,
-                const std::vector<Cand> &cands) {
-    for (const auto &c : cands) {
-      bool locked = (locked_id_ >= 0 && c.id == locked_id_);
-      c.om->rect_params.border_color = locked
+                const std::vector<Cand> &cands, Chan &c) {
+    for (const auto &cd : cands) {
+      bool locked = (c.locked_id >= 0 && cd.id == c.locked_id);
+      cd.om->rect_params.border_color = locked
           ? NvOSD_ColorParams{0.0, 1.0, 0.0, 1.0}
           : NvOSD_ColorParams{1.0, 0.6, 0.0, 1.0};
-      c.om->rect_params.border_width = locked ? 4 : 2;
+      cd.om->rect_params.border_width = locked ? 4 : 2;
     }
 
     NvDsDisplayMeta *dm = nvds_acquire_display_meta_from_pool(batch);
     int n = 0;
     char buf[128];
 
-    if (locked_id_ >= 0)
-      snprintf(buf, sizeof(buf), "LOCK id=%ld  conf=%.2f", locked_id_, pub_conf_);
+    if (c.locked_id >= 0)
+      snprintf(buf, sizeof(buf), "LOCK id=%ld  conf=%.2f", c.locked_id, c.pub_conf);
     else
       snprintf(buf, sizeof(buf), "KILIT YOK");
     setLabel(&dm->text_params[n++], buf, 12, 12, 13);
 
-    if (locked_id_ >= 0 && pub_valid_)
+    if (c.locked_id >= 0 && c.pub_valid)
       snprintf(buf, sizeof(buf), "px=(%.0f,%.0f)  bx=%.3f by=%.3f",
-               pub_u_, pub_v_, pub_bx_, pub_by_);
-    else if (locked_id_ >= 0)
-      snprintf(buf, sizeof(buf), "px=(%.0f,%.0f)  (intrinsics yok)", pub_u_, pub_v_);
+               c.pub_u, c.pub_v, c.pub_bx, c.pub_by);
+    else if (c.locked_id >= 0)
+      snprintf(buf, sizeof(buf), "px=(%.0f,%.0f)  (intrinsics yok)", c.pub_u, c.pub_v);
     else
       snprintf(buf, sizeof(buf), " ");
     setLabel(&dm->text_params[n++], buf, 12, 36, 13);
 
     const int MAXL = 16;   // NvDsDisplayMeta text_params siniri
-    for (const auto &c : cands) {
+    for (const auto &cd : cands) {
       if (n >= MAXL) break;
-      snprintf(buf, sizeof(buf), "%ld:%.2f", c.id, c.conf);
-      setLabel(&dm->text_params[n++], buf, (int)(c.u - 20), (int)(c.v - 28), 11);
+      snprintf(buf, sizeof(buf), "%ld:%.2f", cd.id, cd.conf);
+      setLabel(&dm->text_params[n++], buf, (int)(cd.u - 20), (int)(cd.v - 28), 11);
     }
     dm->num_labels = n;
     nvds_add_display_meta_to_frame(fm, dm);
   }
 
-  void updateLock(const std::vector<Cand> &cands) {
+  // Kilit mantigi her beslenen kanalda calisir (bant icinde ikisi de kilit tutar);
+  // yayini sadece AKTIF kanal yapar (publishBearing/publishInvalid icinde).
+  void updateLock(Chan &c, const std::vector<Cand> &cands) {
     const double cx0 = W_ * 0.5, cy0 = H_ * 0.5;
 
     // ---- YAKALAMA: kilit yok -> merkeze en yakin araci kilitle ----
-    if (locked_id_ < 0) {
-      if (cands.empty()) { publishInvalid(); return; }
+    if (c.locked_id < 0) {
+      if (cands.empty()) { publishInvalid(c); return; }
       const Cand *best = nullptr; double bd = 1e18;
-      for (auto &c : cands) {
-        double d = (c.u - cx0) * (c.u - cx0) + (c.v - cy0) * (c.v - cy0);
-        if (d < bd) { bd = d; best = &c; }
+      for (auto &cd : cands) {
+        double d = (cd.u - cx0) * (cd.u - cx0) + (cd.v - cy0) * (cd.v - cy0);
+        if (d < bd) { bd = d; best = &cd; }
       }
-      lockTo(best->id, best->u, best->v, true);
-      pub_conf_ = best->conf;
-      RCLCPP_INFO(get_logger(), "KILIT acildi -> id=%ld @(%.0f,%.0f) conf=%.2f L=%.1fm",
-                  best->id, best->u, best->v, best->conf, best->len_m);
-      publishBearing(best->id, best->u, best->v);
+      lockTo(c, best->id, best->u, best->v, true);
+      c.pub_conf = best->conf;
+      RCLCPP_INFO(get_logger(), "[%s] KILIT acildi -> id=%ld @(%.0f,%.0f) conf=%.2f L=%.1fm",
+                  c.name, best->id, best->u, best->v, best->conf, best->len_m);
+      publishBearing(c, best->id, best->u, best->v);
       return;
     }
 
     // ---- TAKIP: tahmini pozisyon = son + hiz (kamera pan'ini onceden takip et) ----
-    const double pu = last_u_ + vel_u_, pv = last_v_ + vel_v_;
+    const double pu = c.last_u + c.vel_u, pv = c.last_v + c.vel_v;
 
     const Cand *match = nullptr;
-    for (auto &c : cands) if (c.id == locked_id_) { match = &c; break; }
+    for (auto &cd : cands) if (cd.id == c.locked_id) { match = &cd; break; }
 
     if (match) {
       // Ayni id: TAHMINE gore gate. Gercek harekete izin verir, isinlanmayi reddeder.
       double res = std::hypot(match->u - pu, match->v - pv);
       if (res > track_gate_px_) {
         RCLCPP_WARN(get_logger(),
-            "GATE: id=%ld tahminden %.0fpx sapti (>%.0f) -> HOLD",
-            locked_id_, res, track_gate_px_);
-        lost_++; deadReckon(pu, pv); publishInvalid(); maybeUnlock();
+            "[%s] GATE: id=%ld tahminden %.0fpx sapti (>%.0f) -> HOLD",
+            c.name, c.locked_id, res, track_gate_px_);
+        c.lost++; deadReckon(c, pu, pv); publishInvalid(c); maybeUnlock(c);
         return;
       }
-      updateVel(match->u - last_u_, match->v - last_v_);
-      last_u_ = match->u; last_v_ = match->v; lost_ = 0;
-      pub_conf_ = match->conf;
-      publishBearing(match->id, match->u, match->v);
+      updateVel(c, match->u - c.last_u, match->v - c.last_v);
+      c.last_u = match->u; c.last_v = match->v; c.lost = 0;
+      c.pub_conf = match->conf;
+      publishBearing(c, match->id, match->u, match->v);
       return;
     }
 
     // ---- KAYIP: kilitli id yok. ASLA hemen baska arabaya atlama. ----
-    lost_++;
-    deadReckon(pu, pv);   // tahmini pozisyonu ilerlet (gate bununla takip eder)
+    c.lost++;
+    deadReckon(c, pu, pv);   // tahmini pozisyonu ilerlet (gate bununla takip eder)
 
     // Yeniden-kilit SADECE su kosulda: yeterince bekledik + tahmine yakin
     // TEK aday var (belirsizlik yok) + SIKI gate icinde. Yoksa dokunma.
     int near = 0; const Cand *only = nullptr;
-    for (auto &c : cands)
-      if (std::hypot(c.u - last_u_, c.v - last_v_) <= reacq_gate_px_) { near++; only = &c; }
+    for (auto &cd : cands)
+      if (std::hypot(cd.u - c.last_u, cd.v - c.last_v) <= reacq_gate_px_) { near++; only = &cd; }
 
-    if (lost_ >= reacq_delay_ && near == 1) {
+    if (c.lost >= reacq_delay_ && near == 1) {
       RCLCPP_INFO(get_logger(),
-          "YENIDEN-KILIT %ld->%ld @(%.0f,%.0f) (tek aday, siki gate)",
-          locked_id_, only->id, only->u, only->v);
-      updateVel(only->u - last_u_, only->v - last_v_);
-      lockTo(only->id, only->u, only->v, false);
-      pub_conf_ = only->conf;
-      publishBearing(only->id, only->u, only->v);
+          "[%s] YENIDEN-KILIT %ld->%ld @(%.0f,%.0f) (tek aday, siki gate)",
+          c.name, c.locked_id, only->id, only->u, only->v);
+      updateVel(c, only->u - c.last_u, only->v - c.last_v);
+      lockTo(c, only->id, only->u, only->v, false);
+      c.pub_conf = only->conf;
+      publishBearing(c, only->id, only->u, only->v);
       return;
     }
 
     // HOLD: kilidi TUT, gecersiz yayinla; cok uzun kayipsa birak.
-    publishInvalid();
-    maybeUnlock();
+    publishInvalid(c);
+    maybeUnlock(c);
   }
 
-  void lockTo(long id, double u, double v, bool reset_vel) {
-    locked_id_ = id; last_u_ = u; last_v_ = v; lost_ = 0; have_last_ = true;
-    if (reset_vel) { vel_u_ = 0; vel_v_ = 0; }
+  void lockTo(Chan &c, long id, double u, double v, bool reset_vel) {
+    c.locked_id = id; c.last_u = u; c.last_v = v; c.lost = 0; c.have_last = true;
+    if (reset_vel) { c.vel_u = 0; c.vel_v = 0; }
   }
-  void updateVel(double du, double dv) {
+  void updateVel(Chan &c, double du, double dv) {
     // tek-kare sicramasini sinirla, sonra hiz EMA'sina kat
     double lim = track_gate_px_;
     du = std::max(-lim, std::min(lim, du));
     dv = std::max(-lim, std::min(lim, dv));
-    vel_u_ = vel_ema_ * du + (1 - vel_ema_) * vel_u_;
-    vel_v_ = vel_ema_ * dv + (1 - vel_ema_) * vel_v_;
+    c.vel_u = vel_ema_ * du + (1 - vel_ema_) * c.vel_u;
+    c.vel_v = vel_ema_ * dv + (1 - vel_ema_) * c.vel_v;
   }
-  void deadReckon(double pu, double pv) {
+  void deadReckon(Chan &c, double pu, double pv) {
     // kayip sirasinda tahmine ilerle, hiz'i hafifce sonumle (belirsizlik artar)
-    last_u_ = pu; last_v_ = pv;
-    vel_u_ *= 0.8; vel_v_ *= 0.8;
+    c.last_u = pu; c.last_v = pv;
+    c.vel_u *= 0.8; c.vel_v *= 0.8;
   }
 
-  void maybeUnlock() {
-    if (locked_id_ >= 0 && lost_ > lost_max_) {
-      RCLCPP_WARN(get_logger(), "KILIT birakildi (id=%ld, %d frame kayip)",
-                  locked_id_, lost_);
-      locked_id_ = -1; have_last_ = false; lost_ = 0; vel_u_ = 0; vel_v_ = 0;
+  void maybeUnlock(Chan &c) {
+    if (c.locked_id >= 0 && c.lost > lost_max_) {
+      RCLCPP_WARN(get_logger(), "[%s] KILIT birakildi (id=%ld, %d frame kayip)",
+                  c.name, c.locked_id, c.lost);
+      c.locked_id = -1; c.have_last = false; c.lost = 0; c.vel_u = 0; c.vel_v = 0;
     }
   }
 
-  void publishBearing(long track_id, double u, double v) {
-    pub_u_ = u; pub_v_ = v;   // olculen piksel — intrinsics olmasa da overlay icin sakla
+  void publishBearing(Chan &c, long track_id, double u, double v) {
+    c.pub_u = u; c.pub_v = v;   // olculen piksel — intrinsics olmasa da overlay icin sakla
     cv::Mat K, D;
     bool haveK;
     {
-      std::lock_guard<std::mutex> lk(k_mtx_);
-      haveK = have_K_;
-      if (haveK) { K = K_.clone(); D = D_.clone(); }
+      std::lock_guard<std::mutex> lk(c.k_mtx);
+      haveK = c.have_K;
+      if (haveK) { K = c.K.clone(); D = c.D.clone(); }
     }
-    if (!haveK) { pub_valid_ = false; return; }  // intrinsics yok -> yon uretemeyiz
+    if (!haveK) { c.pub_valid = false; return; }  // intrinsics yok -> yon uretemeyiz
     std::vector<cv::Point2d> in{cv::Point2d(u, v)}, out;
-    cv::undistortPoints(in, out, K, D);   // normalize (X/Z, Y/Z)
-    pub_bx_ = out[0].x; pub_by_ = out[0].y; pub_valid_ = true;  // display icin sakla
+    cv::undistortPoints(in, out, K, D);   // normalize (X/Z, Y/Z), bu kameranin cercevesi
+    double bx = out[0].x, by = out[0].y;
+    if (c.idx == IR) irToColor(bx, by);  // paket RENKLI kamera cercevesinde kalsin
+    c.pub_bx = bx; c.pub_by = by; c.pub_valid = true;  // display icin sakla
+    if (c.idx != active_.load()) return;  // isinma kanali: kilit tutar, yayinlamaz
     geometry_msgs::msg::Vector3Stamped m;
-    { std::lock_guard<std::mutex> lk(stamp_mtx_); m.header.stamp = last_stamp_; }
+    { std::lock_guard<std::mutex> lk(c.stamp_mtx); m.header.stamp = c.last_stamp; }
     m.header.frame_id = "camera";
-    m.vector.x = out[0].x;
-    m.vector.y = out[0].y;
+    m.vector.x = bx;
+    m.vector.y = by;
     m.vector.z = (double)track_id;   // >=0 gecerli
     pub_->publish(m);
   }
 
-  void publishInvalid() {
-    pub_valid_ = false;
+  void publishInvalid(Chan &c) {
+    c.pub_valid = false;
+    if (c.idx != active_.load()) return;
     geometry_msgs::msg::Vector3Stamped m;
-    { std::lock_guard<std::mutex> lk(stamp_mtx_); m.header.stamp = last_stamp_; }
+    { std::lock_guard<std::mutex> lk(c.stamp_mtx); m.header.stamp = c.last_stamp; }
     m.header.frame_id = "camera";
     m.vector.x = 0.0; m.vector.y = 0.0; m.vector.z = -1.0;
     pub_->publish(m);
@@ -972,7 +1199,7 @@ private:
   }
 
   // ---- params ----
-  std::string image_topic_, cinfo_topic_, nvinfer_cfg_, tracker_cfg_, tracker_cfg_file_;
+  std::string tracker_cfg_, tracker_cfg_file_;
   int W_, H_, lost_max_, pgie_interval_, reacq_delay_;
   double conf_th_, track_gate_frac_, reacq_gate_frac_, vel_ema_;
   double track_gate_px_, reacq_gate_px_;
@@ -983,6 +1210,18 @@ private:
   double record_scale_ = 1.0;
   std::set<int> vehicle_cls_;
 
+  // ---- kanallar + iki kamera ----
+  std::array<std::unique_ptr<Chan>, 2> ch_;
+  bool   dual_ = false;
+  double down_m_ = 12.0, up_m_ = 18.0, alt_lost_s_ = 10.0;
+  std::atomic<int> active_{EO};
+  std::mutex mode_mtx_;
+  uint32_t band_tick_ = 0;   // logBandDiff (guard timer'i)
+  std::string ext_topic_;
+  std::mutex ext_mtx_;
+  double ext_R_[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, ext_t_[3] = {0, 0, 0};
+  bool have_ext_ = false, ext_warned_ = false;
+
   // ---- dayaniklilik ----
   int    copy_hw_ = 0, max_rss_mb_ = 1500;
   double stall_timeout_s_ = 3.0, test_fail_after_s_ = 0.0;
@@ -991,49 +1230,21 @@ private:
   std::atomic<bool> fatal_{false};
   std::mutex  fatal_mtx_;
   std::string fatal_reason_;
-  std::atomic<int64_t> last_in_ns_{0}, last_out_ns_{0};   // steady ns; out 0 = henuz cikti yok
   std::chrono::steady_clock::time_point t_start_;
   rclcpp::TimerBase::SharedPtr guard_timer_;
 
   // ---- OpenCV recorder (IR-tarzi: VideoWriter MJPG .avi, kare kare) ----
-  std::mutex   rec_ov_mtx_;   // probe yazar, onImage okur
-  RecOverlay   rec_ov_;
   cv::VideoWriter writer_;
   bool         writer_open_ = false;
 
-  // OSD/kayit overlay'i icin son kilitli hedef (yalniz probe thread'inden erisilir)
-  double pub_bx_ = 0, pub_by_ = 0;   // bearing X/Z, Y/Z
-  double pub_u_ = 0, pub_v_ = 0;     // olculen piksel merkezi
-  double pub_conf_ = 0;              // kilitli aracin confidence'i
-  bool pub_valid_ = false;
-
-  // ---- intrinsics ----
-  std::mutex k_mtx_;
-  cv::Mat K_, D_;
-  bool have_K_ = false;
-
-  // ---- kilit durumu (yalniz probe thread'inden erisilir) ----
-  long locked_id_ = -1;
-  double last_u_ = 0, last_v_ = 0;
-  double vel_u_ = 0, vel_v_ = 0;   // piksel/kare hiz tahmini (pan takibi)
-  bool have_last_ = false;
-  int lost_ = 0;
-
-  // ---- stamp ----
-  std::mutex stamp_mtx_;
-  builtin_interfaces::msg::Time last_stamp_;
-
   // ---- gstreamer ----
-  GstElement *pipeline_ = nullptr, *appsrc_ = nullptr, *mux_ = nullptr,
-             *pgie_ = nullptr, *tracker_ = nullptr;
   GMainLoop *loop_ = nullptr;
   std::thread gthread_;
 
   // ---- ROS ----
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
-  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_ci_;
   rclcpp::Subscription<sensor_msgs::msg::Range>::SharedPtr sub_alt_;
+  rclcpp::Subscription<realsense2_camera_msgs::msg::Extrinsics>::SharedPtr sub_ext_;
 
   // ---- boy filtresi (HRVS irtifasi) ----
   bool   size_filter_ = true;

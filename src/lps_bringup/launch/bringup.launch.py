@@ -56,6 +56,9 @@ CAR_MODELS = {'640': 'visdrone', '960': 'visdrone_960',
               '736x1280': 'visdrone_736x1280', '1280': 'visdrone_1280'}
 CAR_MODEL_DEFAULT = '736x1280'
 CAR_MODEL_FALLBACK = '640'           # bilinmeyen isimde yigini DUSURME, eski modele don
+# Iki kamera (03_11): alcakta infra1 + bu model. 640 giris IR'de kayitta 3-25 m %95-100;
+# EO + 736x1280 ~11 m altinda kaciriyordu. Gecis car_detector'da HRVS irtifasiyla.
+CAR_MODEL_LOW_DEFAULT = '640'
 CAR_CONFIG_NAME = 'config_infer_primary_yoloV8_visdrone.txt'
 CAR_ENGINE_NAME = 'model_b1_gpu0_fp16.engine'
 
@@ -152,6 +155,14 @@ def generate_launch_description():
     # nvvideoconvert yuzey kopyasi: 0 = varsayilan (GPU), 2 = VIC. 19_10 ucusundaki GPU
     # MMU hatasi (kopya motoru ce0, NULL adres) icin DENEME — 20_10 kullanici istegiyle acik.
     car_copy_hw_arg = DeclareLaunchArgument('car_copy_hw', default_value='2')
+    car_dual_arg = DeclareLaunchArgument('car_dual', default_value='true',
+        description='Iki kamera: yuksekte EO+car_model, alcakta IR+car_model_low (false: sadece EO)')
+    car_model_low_arg = DeclareLaunchArgument('car_model_low', default_value=CAR_MODEL_LOW_DEFAULT,
+        description='Alcak irtifa (IR) modeli: ' + ' | '.join(CAR_MODELS))
+    car_switch_down_arg = DeclareLaunchArgument('car_switch_down_m', default_value='12.0',
+        description='Alcalirken bu irtifanin altinda IR modeline gec (m)')
+    car_switch_up_arg = DeclareLaunchArgument('car_switch_up_m', default_value='18.0',
+        description='Yukselirken bu irtifanin ustunde EO modeline don (m)')
     car_model_arg = DeclareLaunchArgument('car_model', default_value=CAR_MODEL_DEFAULT,
         description='Arac modeli giris boyutu: ' + ' | '.join(CAR_MODELS))
     # Kamera kare hizi (IR 1280x720: 6 / 15 / 30). Iki kamera donanimda senkron;
@@ -366,6 +377,11 @@ def generate_launch_description():
         acts = [LogInfo(msg=f'car_detector modeli: {name} -> {cfg}')]
         if name != want:
             acts.append(LogInfo(msg=f'UYARI: bilinmeyen car_model "{want}" -> {name} kullaniliyor'))
+        dual = LaunchConfiguration('car_dual').perform(context).lower() in ('true', '1')
+        low_name, low_cfg, low_engine = car_model_paths(LaunchConfiguration('car_model_low').perform(context))
+        if dual:
+            acts.append(LogInfo(msg=f'car_detector IKI KAMERA: alcak (IR) modeli {low_name} -> {low_cfg}'))
+            have_engine = have_engine and low_engine
         if not have_engine:
             acts.append(LogInfo(msg='UYARI: motor yok, ilk acilista ~6 dk derlenecek; RAM bekcisi kapali'))
         acts.append(
@@ -391,6 +407,12 @@ def generate_launch_description():
                 'copy_hw':         ParameterValue(LaunchConfiguration('car_copy_hw'), value_type=int),
                 'max_rss_mb':      1500 if have_engine else 0,   # normal ~560 MB; motor derlenirken ~1850
                 'stall_timeout_s': 3.0,
+                'dual_camera':        dual,
+                'ir_nvinfer_config':  low_cfg if dual else '',
+                'ir_image_topic':       '/camera/camera/infra1/image_rect_raw',
+                'ir_camera_info_topic': '/camera/camera/infra1/camera_info',
+                'switch_down_m':  ParameterValue(LaunchConfiguration('car_switch_down_m'), value_type=float),
+                'switch_up_m':    ParameterValue(LaunchConfiguration('car_switch_up_m'), value_type=float),
             }],
         )
         )
@@ -483,6 +505,10 @@ def generate_launch_description():
         car_record_scale_arg,
         car_copy_hw_arg,
         car_model_arg,
+        car_dual_arg,
+        car_model_low_arg,
+        car_switch_down_arg,
+        car_switch_up_arg,
         camera_fps_arg,
         infra2_equal_arg,
         serial_port_arg,

@@ -13,6 +13,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(realsense2_camera_msgs REQUIRED)   # IR->renkli extrinsics (iki kamera)
 find_package(OpenCV REQUIRED)
 
 find_package(PkgConfig REQUIRED)
@@ -36,7 +37,7 @@ target_link_libraries(car_detector_node
   nvdsgst_meta nvds_meta)
 
 ament_target_dependencies(car_detector_node
-  rclcpp sensor_msgs geometry_msgs ament_index_cpp)
+  rclcpp sensor_msgs geometry_msgs ament_index_cpp realsense2_camera_msgs)
 
 # DeepStream .so'lari calisma aninda bulunsun
 set_target_properties(car_detector_node PROPERTIES
