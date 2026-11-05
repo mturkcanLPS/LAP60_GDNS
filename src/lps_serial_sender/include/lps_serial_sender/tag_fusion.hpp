@@ -27,9 +27,10 @@
 /*   1 = 45/24 modu : iki-tag DUZ TAG test inisi                       */
 /*                    (avgPos = 45 offset'li / 24 olcekli)             */
 /* Modu degistirmek icin SADECE bu satirdaki 0/1'i degistir + build.  */
-/* NOT: 45/24 modunda node size 0.245 olmali (tag 45=245mm).          */
+/* NOT: 45/24 modunda node size 0.245 olmali (tag 45=245mm);         */
+/*      huni modunda 0.26 (duvar tag) — launch APRILTAG_DETECT['size']. */
 /* ------------------------------------------------------------------ */
-#define TEST_APRITLAG 1
+#define TEST_APRITLAG 0
 
 namespace lps {
 
@@ -85,17 +86,43 @@ inline void quatToRPY(double qx, double qy, double qz, double qw,
     yaw = (float)std::atan2(siny, cosy);
 }
 
-/** tag25h9 HUNI offset'leri - LPS kalibrasyonu (26_08_20, dip = kucuk tag
- *  centroid anchor). 8 tag da AYNI dip noktayi hedefler. Uyum ~3.6mm.
- *  Lap60 AYNI fiziksel huniyi kullaniyor -> ayni degerler.
- *  Duvar 0/20/24/34 (size 0.25), kucuk 10/12/14/16 (size 0.077, ID 25h9<35). */
+/** tag25h9 HUNI offset'leri. Tag frame (libapriltag): x sag, y asagi, z duvara.
+ *
+ *  Duvar 0/20/24/34 — siyah kare 260 mm (05_11 kalibrasyonu):
+ *    Cizim OKAD-MBI-P4a-101 REV02: huni yari aci 44.9, kucuk cap 310.4,
+ *    tag merkezi eksenden 290.0 mm, dip duzleminden 135.2 mm yukarida.
+ *    Referans nokta = huni DIBI (kucuk cember) merkezi. Alt kenarlar dibe bakar.
+ *    Ustten bakista 410x410 kare koselerinde: 0 sag-ust, 34 sag-alt,
+ *    24 sol-alt, 20 sol-ust ("Kuzey/Dogu/..." sadece isim).
+ *    Baslangic: cizimden (Fable 5.1) = (0, +0.3013, -0.1092).
+ *    s0110/s0111 elle ortalanmis IR kayitlari (infra1+infra2, 139 es-zamanli
+ *    duvar tag cifti, gercek cpu_apriltag_node):
+ *      - tag merkezi-eksen yaricapi 281 mm (cizim 290); her kayit x kamera
+ *        alt grubunda 280-281, fx'e duyarsiz.
+ *      - koni yari acisi 44.83 (cizim 44.9) -> huni cizimdeki gibi bukulmus.
+ *      - tag 26 cm kesin (kullanici).
+ *    Tag'ler cizimdeki yerinde: alt kenar ortasi-huni dibi ~6 cm olculdu
+ *    (cizim 60.9). Olculen yaricapin 290 degil ~280 cikmasi PnP yanliligi:
+ *    tag yuzeye SARILI (~410 mm egrilik, kenarlar ~2 cm kalkik), node duz
+ *    kare varsayiyor. Ray-cast simulasyonu (cizim geometrisi + gercek node)
+ *    farkin yarisini aciklar (~1 m'de 285).
+ *    KESIN DEGER: 05_11 canli kalibrasyon, tam cozunurluk, gercek intrinsics
+ *    (fx 647.5). Veri: 570 es-zamanli duvar tag cifti, infra1+infra2,
+ *    0.85-1.3 m. Sonuc: yaricap 280.3; kamera ve mesafe bandi basina
+ *    279-281. Cift farki medyan 7.3 mm (Fable ofsetiyle 20.3).
+ *    Tek tek tag'lerde sistematik sapma <=3 mm -> tag basi duzeltme yok.
+ *    Eksen boyu (~137 mm, referans huni dibi) cizimden: duvar ciftlerinden
+ *    gozlenemez. Kavis z'yi mesafeyle hafif kaydirir (sim: 3 m'de ~3 cm).
+ *  Kucuk 10/12/14/16 (size 0.077): ESKI LPS kalibrasyonu (26_08_20, dip =
+ *    kucuk tag centroid anchor). 05_11 kayitlarinda takili degildi;
+ *    yeni duvar ofsetleriyle ayni noktayi gosterdigi DOGRULANMADI. */
 inline const std::map<int, TagMeta> &funnelTagMeta()
 {
     static const std::map<int, TagMeta> m = {
-        { 0, {cv::Vec3f(+0.0023f, +0.2998f, -0.0712f), 0.25f}},   // N
-        {20, {cv::Vec3f(-0.0019f, +0.2986f, -0.0789f), 0.25f}},   // E
-        {24, {cv::Vec3f(+0.0027f, +0.3008f, -0.0735f), 0.25f}},   // S
-        {34, {cv::Vec3f(+0.0014f, +0.2993f, -0.0757f), 0.25f}},   // W
+        { 0, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Kuzey (cizim sag-ust)
+        {34, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Dogu  (cizim sag-alt)
+        {24, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Guney (cizim sol-alt)
+        {20, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Bati  (cizim sol-ust)
         {10, {cv::Vec3f(+0.0429f, +0.0430f, -0.0010f), 0.077f}},  // sol-ust
         {12, {cv::Vec3f(-0.0435f, +0.0432f, +0.0045f), 0.077f}},  // sag-ust
         {14, {cv::Vec3f(+0.0432f, -0.0427f, -0.0095f), 0.077f}},  // sol-alt
@@ -184,7 +211,7 @@ inline TagFusion fuseFunnel(const std::vector<TagDet> &dets, float node_size)
             if (!used) continue;
             sum += estimates[i]; n_inliers++;
             // Sabit ID -> bit (outlier = median'dan >0.4m, bit basmaz):
-            //   valid1=0(N) valid2=20(E) valid3=24(S) valid4=34(W)  [duvar]
+            //   valid1=0(Kuzey) valid2=20(Bati) valid3=24(Guney) valid4=34(Dogu)  [duvar]
             //   valid5=10   valid6=12    valid7=14    valid8=16      [kucuk 2x2]
             switch (used_ids[i]) {
                 case  0: f.id_bits |= 1u << 0; break;

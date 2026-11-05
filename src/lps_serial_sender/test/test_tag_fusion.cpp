@@ -72,16 +72,14 @@ static cv::Matx33f quatToMatrix(double qx, double qy, double qz, double qw)
 }
 
 struct Old {
-    const std::map<int, TagMeta> tag_meta_ = {
-        { 0, {cv::Vec3f(+0.0023f, +0.2998f, -0.0712f), 0.25f}},   // N
-        {20, {cv::Vec3f(-0.0019f, +0.2986f, -0.0789f), 0.25f}},   // E
-        {24, {cv::Vec3f(+0.0027f, +0.3008f, -0.0735f), 0.25f}},   // S
-        {34, {cv::Vec3f(+0.0014f, +0.2993f, -0.0757f), 0.25f}},   // W
-        {10, {cv::Vec3f(+0.0429f, +0.0430f, -0.0010f), 0.077f}},  // sol-ust
-        {12, {cv::Vec3f(-0.0435f, +0.0432f, +0.0045f), 0.077f}},  // sag-ust
-        {14, {cv::Vec3f(+0.0432f, -0.0427f, -0.0095f), 0.077f}},  // sol-alt
-        {16, {cv::Vec3f(-0.0434f, -0.0428f, +0.0010f), 0.077f}},  // sag-alt
-    };
+    // Offset tablosu tag_fusion.hpp'den kopyalanir: bu test ALGORITMA
+    // esdegerligini olcer; kalibrasyon (offset/boyut) degisince bozulmasin.
+    const std::map<int, TagMeta> tag_meta_ = [] {
+        std::map<int, TagMeta> m;
+        for (const auto &kv : lps::funnelTagMeta())
+            m[kv.first] = {kv.second.offset, kv.second.physical_size_m};
+        return m;
+    }();
     float apriltag_node_size_;
 
     Pack run4524(const Msg *msg) const {

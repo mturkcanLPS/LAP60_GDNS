@@ -193,9 +193,9 @@ struct float_angle_t {
 struct tag_validity_t {
     uint16_t valid    : 1;   // avgPos gecerli (n_inlier>0)
     uint16_t valid1   : 1;   // 0(N)
-    uint16_t valid2   : 1;   // 20(E)
+    uint16_t valid2   : 1;   // 20(Bati)
     uint16_t valid3   : 1;   // 24(S)
-    uint16_t valid4   : 1;   // 34(W)
+    uint16_t valid4   : 1;   // 34(Dogu)
     uint16_t valid5   : 1;   // 10
     uint16_t valid6   : 1;   // 12
     uint16_t valid7   : 1;   // 14
@@ -403,7 +403,7 @@ static apriltagPack_t packFromFusion(const lps::TagFusion &f, uint32_t ts)
     ap.avgPos.angle.pitch     = f.pitch;
     ap.avgPos.angle.yaw       = f.yaw;
     // Huni modunda inlier tag bitleri (45/24 modunda hepsi 0):
-    //   valid1=0(N) valid2=20(E) valid3=24(S) valid4=34(W)  [duvar]
+    //   valid1=0(Kuzey) valid2=20(Bati) valid3=24(Guney) valid4=34(Dogu)  [duvar]
     //   valid5=10   valid6=12    valid7=14    valid8=16      [kucuk 2x2]
     ap.avgPos.validity.valid1 = (f.id_bits >> 0) & 1u;
     ap.avgPos.validity.valid2 = (f.id_bits >> 1) & 1u;

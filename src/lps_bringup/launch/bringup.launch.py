@@ -18,17 +18,17 @@ from launch_ros.descriptions import ComposableNode, ParameterValue
 # birden degistirir, kayma olamaz.
 # ---------------------------------------------------------------------------
 APRILTAG_DETECT = {                  # cpu_apriltag (infra1) + cpu_apriltag_infra2
-    'size':              0.245,      # tag25h9 huni duvar buyuk tag = 250mm
+    'size':              0.26,       # tag25h9 huni duvar tag siyah kare = 260mm (45/24 testi: 0.245)
     'quad_decimate':     1.0,        # tam cozunurluk (kucuk/uzak tag)
     'quad_sigma':        0.0,
     'decode_sharpening': 1.0,        # bulanik/egik tag icin
     'refine_edges':      True,
 }
 # serial_sender + infra2_recorder: tag -> avgPos fuzyonunda kullanilan node size.
-# DIKKAT: tag_fusion.hpp 'NOT: 45/24 modunda node size 0.245 olmali' diyor;
-# APRILTAG_DETECT['size'] 0.245 iken burasi 0.25 (degisiklik oncesiyle ayni
-# birakildi, bilincli karar bekliyor).
-FUSION_NODE_SIZE = 0.25
+# APRILTAG_DETECT['size'] ile AYNI olmali (fuzyon olcegi = gercek boyut / bu).
+# Huni modu (TEST_APRITLAG 0): duvar tag 0.26 -> olcek 1. 45/24 testine
+# donulurse ikisi de 0.245 yapilmali (tag_fusion.hpp NOT).
+FUSION_NODE_SIZE = APRILTAG_DETECT['size']
 FLOW = {                             # serial_sender + infra2_recorder
     'grid_size':            4,
     # Piramit seviyesi = izlenebilir MAKS kayma (her seviye 2 kat):
@@ -131,7 +131,7 @@ def generate_launch_description():
     #   (hrvs + funnel + flow) hangisi acilirsa onu tuketir, degismez.
     backend_arg = DeclareLaunchArgument('apriltag_backend', default_value='cpu')
     # Huni tag25h9 -> default. Baska aile denemek icin tag_family:=... ile ez.
-    tag_family_arg = DeclareLaunchArgument('tag_family', default_value='tag36h11')
+    tag_family_arg = DeclareLaunchArgument('tag_family', default_value='tag25h9')
     # IKINCI IR KAMERA (infra2): acilir, uzerinde AprilTag + optik akis
     # hesaplanir; sonuclar paketin SONUNDAKI aprtiltag2 / opticflow2 alanlariyla
     # SERIALE GIDER (infra1 alanlariyla birlestirilmez, ayri alanlar) ve ayrica
@@ -272,8 +272,8 @@ def generate_launch_description():
                     ('camera_info', '/camera/camera/infra1/camera_info'),
                 ],
                 parameters=[{
-                    # Huni duvar buyuk tag siyah kare = 250mm (funnel scale=1.0).
-                    'size': 0.25,
+                    # Huni duvar tag siyah kare = 260mm (funnel scale=1.0).
+                    'size': APRILTAG_DETECT['size'],
                     'tag_family': 'tag25h9',
                     'max_tags': 64,
                     'tile_size': 4,
