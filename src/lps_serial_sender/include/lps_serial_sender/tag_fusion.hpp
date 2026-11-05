@@ -111,22 +111,54 @@ inline void quatToRPY(double qx, double qy, double qz, double qw,
  *    0.85-1.3 m. Sonuc: yaricap 280.3; kamera ve mesafe bandi basina
  *    279-281. Cift farki medyan 7.3 mm (Fable ofsetiyle 20.3).
  *    Tek tek tag'lerde sistematik sapma <=3 mm -> tag basi duzeltme yok.
- *    Eksen boyu (~137 mm, referans huni dibi) cizimden: duvar ciftlerinden
- *    gozlenemez. Kavis z'yi mesafeyle hafif kaydirir (sim: 3 m'de ~3 cm).
- *  Kucuk 10/12/14/16 (size 0.077): ESKI LPS kalibrasyonu (26_08_20, dip =
- *    kucuk tag centroid anchor). 05_11 kayitlarinda takili degildi;
- *    yeni duvar ofsetleriyle ayni noktayi gosterdigi DOGRULANMADI. */
+ *    Cift kalibrasyonu (yaricap) huni dibi cemberine gore (0, +0.2942, -0.1021)
+ *    verdi; eksen boyu duvar ciftlerinden gozlenemez -> kucuk taglerle olculdu
+ *    (asagidaki REFERANS notu). Kavis z'yi mesafeyle hafif kaydirir
+ *    (sim: 3 m'de ~3 cm); yanal stabil.
+ *  Kucuk tag'ler (05_11 yeni duzen, kullanici olculeri): 4 adet, ID 10/12/14/16,
+ *    tag25h9, siyah kare 65 mm. Huni dibinde duz yatar, yukari bakar. Tag merkezleri
+ *    huni merkezine gore (ustten, x saga, y yukari): 10 (-4.5, +7.0) sol-ust,
+ *    12 (+4.5, +7.0) sag-ust, 14 (-4.5, -7.0) sol-alt, 16 (+4.5, -7.0) sag-alt cm.
+ *    Tag frame'inde merkeze ofset = (-x, +y, z): tag y'si (goruntude asagi)
+ *    cizimin -y'si. Isaret kurali eski LPS kalibrasyonuyla ayni (eski 10 sol-ust
+ *    = (+0.043, +0.043)).
+ *    05_11 canli kayit (kalib_191817; kucuk + duvar ayni karede, ~1 m):
+ *      - Isaret kurali DOGRULANDI: olculen ofsetlerin dort tag'de de isareti kodla ayni.
+ *      - Yanal: 12/14 kullanici olcusune ~0.5 cm icinde (fark gurultu duzeyinde,
+ *        7-8 mm) -> kullanici olculeri korundu.
+ *      - z: kesin referans/z icin funnelTagMeta ustundeki nota bak.
+ *      - 10 ve 16 nadir okunuyor (12/14: 3500'er kare, 10: 90, 16: 46):
+ *        16'nin uzerinden kablo geciyor; 10'un sebebi belirsiz.
+ *    Plaka kaymasi duzeltmesi (kullanici onayi): iki kayitta da 12/14/16'nin
+ *      hepsi tag-y'de ayni yone +4.3..+6.7 mm (ort +5.4) sistematik sapti, x'te
+ *      ~0. Tek tek tag hatasi degil, kucuk tag plakasi huni ekseninden ~5 mm
+ *      kaymis (10/12 tarafina). Dort tag'in y ofsetine +5.4 mm eklendi:
+ *      10/12 y = +0.0754, 14/16 y = -0.0646 (olculen konumlar +-7.0 cm).
+ *    Menzil: 65 mm tag ~15 px'te cozulur -> ~2.8 m'nin altinda gorulur. */
+/* REFERANS NOKTA = KUCUK TAG PLAKASI MERKEZI (05_11, kullanici; eski LPS gibi).
+ *   Plaka, duvar tag merkezlerinin huni ekseni boyunca 14.5 cm ALTINDA (canli
+ *   veri kalib_194158: ~1.3 m'de 13.7-14.1, ~1.0 m'de 15.4; fark tag kavisinin
+ *   mesafeye bagli yanliligi).
+ *   Duvar: yatay bilesen 280 mm, tag frame'inde yatay-ice birim (0, 0.706, -0.708)
+ *   -> (0, +0.1977, -0.1983); arti eksen (asagi = (0, 0.708, 0.706)) boyunca
+ *   14.5 cm -> (0, +0.3004, -0.0959).
+ *   Kucuk: x/y kullanici olcusu (+plaka kaymasi duzeltmesi), z = 0.
+ *   Neden plaka, duvar hizasi degil: 65 mm kucuk tag'in egim tahmini ~9 derece
+ *   oynuyor; kucuk taglere 14.5 cm z ofseti verilseydi bu ~2.2 cm medyan (p90
+ *   4 cm) yanal oynamaya donusurdu. Plaka referansinda ~0.6 cm. 26 cm duvar
+ *   tag'leri egimi iyi olctugu icin uzayan ofsetleri mm duzeyinde ek hata getirir.
+ *   (Duvar hizasi referansi isteninse: duvar (0, +0.1977, -0.1983), kucuk z -0.145.) */
 inline const std::map<int, TagMeta> &funnelTagMeta()
 {
     static const std::map<int, TagMeta> m = {
-        { 0, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Kuzey (cizim sag-ust)
-        {34, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Dogu  (cizim sag-alt)
-        {24, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Guney (cizim sol-alt)
-        {20, {cv::Vec3f(0.0f, +0.2942f, -0.1021f), 0.26f}},   // Bati  (cizim sol-ust)
-        {10, {cv::Vec3f(+0.0429f, +0.0430f, -0.0010f), 0.077f}},  // sol-ust
-        {12, {cv::Vec3f(-0.0435f, +0.0432f, +0.0045f), 0.077f}},  // sag-ust
-        {14, {cv::Vec3f(+0.0432f, -0.0427f, -0.0095f), 0.077f}},  // sol-alt
-        {16, {cv::Vec3f(-0.0434f, -0.0428f, +0.0010f), 0.077f}},  // sag-alt
+        { 0, {cv::Vec3f(0.0f, +0.3004f, -0.0959f), 0.26f}},   // Kuzey (cizim sag-ust)
+        {34, {cv::Vec3f(0.0f, +0.3004f, -0.0959f), 0.26f}},   // Dogu  (cizim sag-alt)
+        {24, {cv::Vec3f(0.0f, +0.3004f, -0.0959f), 0.26f}},   // Guney (cizim sol-alt)
+        {20, {cv::Vec3f(0.0f, +0.3004f, -0.0959f), 0.26f}},   // Bati  (cizim sol-ust)
+        {10, {cv::Vec3f(+0.045f, +0.0754f, 0.0f), 0.065f}},  // sol-ust (-4.5, +7.0 cm)
+        {12, {cv::Vec3f(-0.045f, +0.0754f, 0.0f), 0.065f}},  // sag-ust (+4.5, +7.0 cm)
+        {14, {cv::Vec3f(+0.045f, -0.0646f, 0.0f), 0.065f}},  // sol-alt (-4.5, -7.0 cm)
+        {16, {cv::Vec3f(-0.045f, -0.0646f, 0.0f), 0.065f}},  // sag-alt (+4.5, -7.0 cm)
     };
     return m;
 }
@@ -212,7 +244,7 @@ inline TagFusion fuseFunnel(const std::vector<TagDet> &dets, float node_size)
             sum += estimates[i]; n_inliers++;
             // Sabit ID -> bit (outlier = median'dan >0.4m, bit basmaz):
             //   valid1=0(Kuzey) valid2=20(Bati) valid3=24(Guney) valid4=34(Dogu)  [duvar]
-            //   valid5=10   valid6=12    valid7=14    valid8=16      [kucuk 2x2]
+            //   valid5=10   valid6=12    valid7=14    valid8=16      [kucuk, 65 mm]
             switch (used_ids[i]) {
                 case  0: f.id_bits |= 1u << 0; break;
                 case 20: f.id_bits |= 1u << 1; break;

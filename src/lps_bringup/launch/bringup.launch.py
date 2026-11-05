@@ -23,6 +23,10 @@ APRILTAG_DETECT = {                  # cpu_apriltag (infra1) + cpu_apriltag_infr
     'quad_sigma':        0.0,
     'decode_sharpening': 1.0,        # bulanik/egik tag icin
     'refine_edges':      True,
+    # Sahte tespit filtresi (tag25h9 kod mesafesi 9): en fazla 1 bit duzeltme +
+    # bit cozme guveni >= 30. 05_11 olcumu: sahtelerin tamami elendi, gercek %98.9.
+    'max_hamming':         1,
+    'min_decision_margin': 30.0,
 }
 # serial_sender + infra2_recorder: tag -> avgPos fuzyonunda kullanilan node size.
 # APRILTAG_DETECT['size'] ile AYNI olmali (fuzyon olcegi = gercek boyut / bu).

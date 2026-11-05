@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -74,6 +75,15 @@ public:
         // kamera zaman damgasina gore (bkz. imgCb) -> infra1/infra2 AYNI anlari isler.
         every_n_    = std::max(1, (int)declare_parameter<int>("process_every_n", 1));
         camera_fps_ = declare_parameter<double>("camera_fps", 30.0);
+        // --- Sahte tespit filtresi (tag25h9: kod mesafesi 9, 2 bit duzeltme sahte ID uretir) ---
+        //   max_hamming: duzeltilecek en fazla bit (libapriltag varsayilani 2).
+        //   min_decision_margin: bit cozme guveni; altindaki tespit atilir.
+        //   05_11 olcum (canli ham bag + ucus #74): gercek tag'lerin %90'i 0 bit,
+        //   %9'u 1 bit; margin medyan 306, en zayif %5 bile >237. Sahtelerin
+        //   %93'u 2 bit, margin medyan 3-10. hamming<=1 & margin>=30 ->
+        //   203 sahteden 0 kaldi, gercek %98.9 korundu.
+        max_hamming_ = std::clamp((int)declare_parameter<int>("max_hamming", 1), 0, 3);
+        min_margin_  = declare_parameter<double>("min_decision_margin", 30.0);
 
         td_ = apriltag_detector_create();
         tf_ = makeFamily(family_name_);
@@ -81,10 +91,9 @@ public:
             RCLCPP_FATAL(get_logger(), "Bilinmeyen tag_family: %s", family_name_.c_str());
             throw std::runtime_error("bad tag_family");
         }
-        // add_family = add_family_bits(...,2): 2 bit duzeltmeye izin. tag36h11
-        // (hamming 11) ile false positive zaten yok -> circle icin eklenen
-        // max_hamming/decision_margin knob'lari kaldirildi.
-        apriltag_detector_add_family(td_, tf_);
+        // add_family varsayilani 2 bit duzeltme: tag36h11'de (kod mesafesi 11)
+        // sorun yoktu, tag25h9'da (9) sahte ID uretiyor -> max_hamming ile sinirli.
+        apriltag_detector_add_family_bits(td_, tf_, max_hamming_);
         td_->quad_decimate    = (float)quad_decimate;
         td_->quad_sigma       = (float)quad_sigma;
         td_->refine_edges     = refine_edges;
@@ -105,9 +114,9 @@ public:
 
         RCLCPP_INFO(get_logger(),
             "CPU AprilTag: family=%s size=%.3f decimate=%.1f sharpen=%.2f "
-            "sigma=%.1f | %s -> %s",
+            "sigma=%.1f max_hamming=%d min_margin=%.0f | %s -> %s",
             family_name_.c_str(), tag_size_, quad_decimate, decode_sharpen,
-            quad_sigma, image_topic_.c_str(), output_topic_.c_str());
+            quad_sigma, max_hamming_, min_margin_, image_topic_.c_str(), output_topic_.c_str());
     }
 
     ~CpuAprilTagNode()
@@ -219,6 +228,11 @@ private:
         for (int i = 0; i < n; ++i) {
             apriltag_detection_t *det;
             zarray_get(dets, i, &det);
+            if (det->decision_margin < min_margin_) {   // dusuk guven -> sahte say, yayinlama
+                ++rejected_;
+                if (det->decision_margin > rejected_max_margin_) rejected_max_margin_ = det->decision_margin;
+                continue;
+            }
 
             apriltag_detection_info_t info;
             info.det = det; info.tagsize = tag_size_;
@@ -253,11 +267,27 @@ private:
         }
         apriltag_detections_destroy(dets);
         pub_->publish(out);
+        // Ucus logunda gorunsun: elenen var mi, en guclu elenen ne kadar guvenliydi
+        // (esige yakin degerler gercek tag'in elendigini gosterebilir).
+        // Yalniz yeni eleme olduysa ve en sik 10 s'de bir.
+        const auto now = std::chrono::steady_clock::now();
+        if (rejected_ != logged_rejected_ && now - last_filter_log_ >= std::chrono::seconds(10)) {
+            RCLCPP_INFO(get_logger(),
+                "[TAG-FILTRE] margin<%.0f ile elenen toplam %lu (en yuksek elenen margin %.1f)",
+                min_margin_, (unsigned long)rejected_, rejected_max_margin_);
+            logged_rejected_ = rejected_; last_filter_log_ = now;
+        }
     }
 
     // params
     std::string image_topic_, cinfo_topic_, output_topic_, family_name_;
     double tag_size_ = 0.25;
+    int    max_hamming_ = 1;
+    double min_margin_ = 30.0;
+    uint64_t rejected_ = 0;               // margin filtresiyle atilan tespit sayisi
+    float  rejected_max_margin_ = 0.0f;
+    uint64_t logged_rejected_ = 0;
+    std::chrono::steady_clock::time_point last_filter_log_{};
 
     apriltag_detector_t *td_ = nullptr;
     apriltag_family_t   *tf_ = nullptr;

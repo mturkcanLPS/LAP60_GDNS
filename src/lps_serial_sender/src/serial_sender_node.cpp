@@ -189,7 +189,7 @@ struct float_angle_t {
 };
 
 /* Tag validity bitfield (LPS packet_defs ile birebir): avgPos + 8 tag biti.
- *   valid1-4 = duvar 0/20/24/34, valid5-8 = kucuk 10/12/14/16. */
+ *   valid1-4 = duvar 0/20/24/34, valid5-8 = kucuk 10/12/14/16 (65 mm). */
 struct tag_validity_t {
     uint16_t valid    : 1;   // avgPos gecerli (n_inlier>0)
     uint16_t valid1   : 1;   // 0(N)
@@ -404,7 +404,7 @@ static apriltagPack_t packFromFusion(const lps::TagFusion &f, uint32_t ts)
     ap.avgPos.angle.yaw       = f.yaw;
     // Huni modunda inlier tag bitleri (45/24 modunda hepsi 0):
     //   valid1=0(Kuzey) valid2=20(Bati) valid3=24(Guney) valid4=34(Dogu)  [duvar]
-    //   valid5=10   valid6=12    valid7=14    valid8=16      [kucuk 2x2]
+    //   valid5=10   valid6=12    valid7=14    valid8=16      [kucuk, 65 mm]
     ap.avgPos.validity.valid1 = (f.id_bits >> 0) & 1u;
     ap.avgPos.validity.valid2 = (f.id_bits >> 1) & 1u;
     ap.avgPos.validity.valid3 = (f.id_bits >> 2) & 1u;
@@ -1398,7 +1398,7 @@ private:
                     pkt.pack.variables.hrvs.frameNumber, rx_bytes_.exchange(0));
 
                 // Tek tek tag pozu artik gonderilmiyor; sadece validity bit'leri.
-                //   duvar valid1-4 = N/E/S/W, kucuk valid5-8 = 10/12/14/16.
+                //   duvar valid1-4 = 0/20/24/34, kucuk valid5-8 = 10/12/14/16.
                 RCLCPP_INFO(get_logger(),
                     "[APRILTAG]  %.1f Hz | avg: valid=%s pos(%.3f,%.3f,%.3f) rpy(%.2f,%.2f,%.2f)"
                     " | duvar[N%d E%d S%d W%d] kucuk[%d%d%d%d]",
