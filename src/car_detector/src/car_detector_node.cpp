@@ -13,7 +13,7 @@
 // IKI KAMERA (03_11, dual_camera:=true): yuksekte EO + buyuk model (736x1280, uzak menzil),
 // alcakta infra1 + 640 model. EO'da 1280 giris ~11 m altinda araci kaciriyor ve 70x43 derece
 // gorus 5 m'de araci sigdirmiyor; IR 87x58 derece + 640 giris kayitta 3-25 m'de %95-100
-// buldu. Gecis HRVS irtifasiyla, histerezisli: alcalirken switch_down_m'de IR'ye, yukselirken
+// buldu. Gecis irtifayla (05_11: once otopilot EKF'i, yoksa HRVS), histerezisli: alcalirken switch_down_m'de IR'ye, yukselirken
 // switch_up_m'de EO'ya. Bant icinde IKI hat da beslenir ve kilit tutar -> gecis bir kare,
 // yeni kanal araci zaten kilitlemis. IR bearing'i RealSense extrinsics'iyle RENKLI kamera
 // cercevesine cevrilir -> otopilot tarafi degismez. Irtifa yoksa (alt_lost_s) eski davranis: EO.
@@ -117,7 +117,8 @@ class CarDetector : public rclcpp::Node {
     float  conf = 0;
     bool   valid = false;
     bool   have_k = false;   // intrinsics var mi (valid=false'un sebebini ayirmak icin)
-    double alt = -1;         // boy filtresinin kullandigi HRVS irtifasi; <0: filtre kapali
+    double alt = -1;         // boy filtresinin kullandigi irtifa (EKF ya da HRVS); <0: filtre kapali
+    int    alt_src = 0;      // ALT_EKF / ALT_HRVS (overlay etiketi)
   };
 
   enum { EO = 0, IR = 1 };
@@ -253,6 +254,11 @@ public:
     edge_px_       = declare_parameter<int>("size_edge_px", 4);   // kenara degen kutu kesik sayilir
     wid_min_m_     = declare_parameter<double>("car_width_min_m", 1.2);   // kesik kutuda paralel boyut alt siniri
     alt_topic_     = declare_parameter<std::string>("altitude_topic", "/hrvs/altitude");
+    // 05_11: otopilotun EKF yuksekligi (0x4A, serial_sender yayinlar; baro + LRF + HRVS).
+    // Tazeyse HRVS yerine bu kullanilir; EKF susarsa/gecersizse HRVS'e duser. Boy filtresi
+    // ve IR/EO gecisi ayni irtifayi kullanir.
+    ekf_topic_     = declare_parameter<std::string>("ekf_altitude_topic", "/autopilot/ekf_altitude");
+    prefer_ekf_    = declare_parameter<bool>("altitude_prefer_ekf", true);
 
     // EO intrinsics: param > 0 ise onu kullan, degilse camera_info bekle
     double fx = declare_parameter<double>("fx", 0.0);
@@ -303,12 +309,29 @@ public:
           [this, c](const sensor_msgs::msg::CameraInfo::SharedPtr m) { onCameraInfo(m, *c); });
     }
     // serial_sender her YENI radar karesinde yayinlar; radar donarsa mesaj kesilir.
+    // EKF tazeyken HRVS yok sayilir (iki kaynak karisip irtifa ziplamasin).
     sub_alt_ = create_subscription<sensor_msgs::msg::Range>(
         alt_topic_, qos, [this](const sensor_msgs::msg::Range::SharedPtr m) {
+          const int64_t now = nowNs(), te = ekf_ns_.load();
+          if (prefer_ekf_ && te != 0 && now - te <= (int64_t)(alt_stale_s_ * 1e9)) return;
+          setAltSrc(ALT_HRVS);
           alt_m_.store(m->range);
-          alt_ns_.store(nowNs());
+          alt_ns_.store(now);
           updateMode();
         });
+    // serial_sender sadece gecerli=1 iken yayinlar; gecersizse mesaj kesilir -> HRVS.
+    if (prefer_ekf_)
+      sub_ekf_ = create_subscription<sensor_msgs::msg::Range>(
+          ekf_topic_, qos, [this](const sensor_msgs::msg::Range::SharedPtr m) {
+            // Yerde ~0 ya da isaret karisikligi (NED -z): EKF yok say -> HRVS bastirilmaz.
+            if (!(m->range > 0.1f)) return;
+            const int64_t now = nowNs();
+            setAltSrc(ALT_EKF);
+            ekf_ns_.store(now);
+            alt_m_.store(m->range);
+            alt_ns_.store(now);
+            updateMode();
+          });
     if (dual_) {
       // RealSense extrinsics'i bir kez (latched) yayinlar -> transient_local ile al.
       sub_ext_ = create_subscription<realsense2_camera_msgs::msg::Extrinsics>(
@@ -333,10 +356,11 @@ public:
 
     RCLCPP_INFO(get_logger(),
         "car_detector hazir | in='%s' mux=%dx%d track_gate=%.0f reacq_gate=%.0f conf>=%.2f"
-        " | copy_hw=%d max_rss=%dMB stall=%.1fs | boy filtresi %s %.1f-%.1f m (irtifa '%s', bayat>%.1fs)",
+        " | copy_hw=%d max_rss=%dMB stall=%.1fs | boy filtresi %s %.1f-%.1f m (irtifa %s'%s', bayat>%.1fs)",
         eo.image_topic.c_str(), W_, H_, track_gate_px_, reacq_gate_px_, conf_th_,
         copy_hw_, max_rss_mb_, stall_timeout_s_,
-        size_filter_ ? "ACIK" : "KAPALI", len_min_m_, len_max_m_, alt_topic_.c_str(), alt_stale_s_);
+        size_filter_ ? "ACIK" : "KAPALI", len_min_m_, len_max_m_,
+        prefer_ekf_ ? ("EKF '" + ekf_topic_ + "', yoksa ").c_str() : "", alt_topic_.c_str(), alt_stale_s_);
     if (dual_)
       RCLCPP_INFO(get_logger(),
           "IKI KAMERA: yuksek=EO '%s' | alcak=IR '%s' (her %d. kare) model '%s' | "
@@ -515,9 +539,10 @@ private:
       feedEO = act == EO; feedIR = act == IR;
     }
     if (act != active_.load()) {
-      RCLCPP_INFO(get_logger(), "KAYNAK %s -> %s (irtifa %s%.1f m) | yeni kanal kilit %s",
+      RCLCPP_INFO(get_logger(), "KAYNAK %s -> %s (irtifa %s%s %.1f m) | yeni kanal kilit %s",
                   ch_[active_.load()]->name, ch_[act]->name, fresh ? "" : "bayat/yok ",
-                  fresh ? alt : 0.0, ch_[act]->locked_id >= 0 ? "HAZIR" : "yok");
+                  altSrcName(alt_src_.load()), fresh ? alt : 0.0,
+                  ch_[act]->locked_id >= 0 ? "HAZIR" : "yok");
       active_.store(act);
     }
     setFed(*ch_[EO], feedEO);
@@ -862,7 +887,8 @@ private:
                 cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     // Boy filtresi durumu (sag ust): kullanilan irtifa ya da neden kapali
     char l3[64];
-    if (ov.alt >= 0) snprintf(l3, sizeof(l3), "HRVS %.1fm  boy %.1f-%.1fm", ov.alt, len_min_m_, len_max_m_);
+    if (ov.alt >= 0) snprintf(l3, sizeof(l3), "%s %.1fm  boy %.1f-%.1fm", altSrcName(ov.alt_src), ov.alt,
+                              len_min_m_, len_max_m_);
     else             snprintf(l3, sizeof(l3), "boy filtresi KAPALI");
     int base = 0;
     const cv::Size ts = cv::getTextSize(l3, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &base);
@@ -985,6 +1011,7 @@ private:
                           cd.id, cd.conf, false, (float)cd.len_m, true});
     }
     ov.alt = g.on ? g.alt : -1;
+    ov.alt_src = alt_src_.load();
     ov.locked_id = c.locked_id;
     ov.bx = c.pub_bx; ov.by = c.pub_by; ov.u = c.pub_u; ov.v = c.pub_v;
     ov.conf = (float)c.pub_conf; ov.valid = c.pub_valid;
@@ -1250,9 +1277,21 @@ private:
   bool   size_filter_ = true;
   double len_min_m_ = 2.5, len_max_m_ = 9.0, alt_stale_s_ = 1.5, wid_min_m_ = 1.2;
   int    edge_px_ = 4;
-  std::string alt_topic_;
+  std::string alt_topic_, ekf_topic_;
+  bool   prefer_ekf_ = true;
   std::atomic<double>  alt_m_{0.0};
-  std::atomic<int64_t> alt_ns_{0};   // son HRVS mesaji (steady ns); 0 = hic gelmedi
+  std::atomic<int64_t> alt_ns_{0};   // son KULLANILAN irtifa mesaji (steady ns); 0 = hic gelmedi
+  std::atomic<int64_t> ekf_ns_{0};   // son EKF mesaji (HRVS'i bastirmak icin)
+  enum { ALT_NONE = 0, ALT_HRVS = 1, ALT_EKF = 2 };
+  std::atomic<int> alt_src_{ALT_NONE};
+  rclcpp::Subscription<sensor_msgs::msg::Range>::SharedPtr sub_ekf_;
+
+  static const char *altSrcName(int s) { return s == ALT_EKF ? "EKF" : s == ALT_HRVS ? "HRVS" : "-"; }
+  void setAltSrc(int s) {
+    const int old = alt_src_.exchange(s);
+    if (old != s)
+      RCLCPP_INFO(get_logger(), "IRTIFA KAYNAGI %s -> %s", altSrcName(old), altSrcName(s));
+  }
 };
 
 int main(int argc, char **argv) {

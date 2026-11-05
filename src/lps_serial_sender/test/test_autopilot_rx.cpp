@@ -10,7 +10,9 @@
  */
 #include "lps_serial_sender/autopilot_rx.hpp"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -85,6 +87,32 @@ int main()
         s.insert(s.end(), KAPAT.begin(), KAPAT.end());
         r.p.feed(s.data(), s.size());
         CHECK(r.got.size() == 3 && r.got[0].first == 0x50 && r.poweroffs() == 2, "0x50 + 2x KAPAT ayri ayri");
+    }
+
+    std::printf("0x4A EKF yuksekligi (05_11)\n");
+    {
+        const uint8_t h[3] = {0xBB, 0x4A, 0x05};
+        CHECK(lps::apChecksum(h, 3) == 0xF6, "header BB 4A 05 -> F6 (otopilot tablosu)");
+        auto frame = [](float z, uint8_t ok) {
+            std::vector<uint8_t> pl(5);
+            std::memcpy(pl.data(), &z, 4); pl[4] = ok;
+            std::vector<uint8_t> s = {0xBB, 0x4A, 0x05, 0xF6};
+            s.insert(s.end(), pl.begin(), pl.end());
+            s.push_back(lps::apChecksum(pl.data(), 5));
+            return s;
+        };
+        Rec r; auto s = frame(12.75f, 1), s0 = frame(3.5f, 0);
+        s.insert(s.end(), KAPAT.begin(), KAPAT.end());
+        s.insert(s.end(), s0.begin(), s0.end());
+        for (uint8_t b : s) r.p.feed(&b, 1);
+        CHECK(r.got.size() == 3 && r.got[0].first == 0x4A && r.got[2].first == 0x4A && r.poweroffs() == 1,
+              "EKF + KAPAT + EKF bayt bayt ayri ayri");
+        float z = 0; bool ok = false;
+        CHECK(lps::decodeEkfAlt(r.got[0].second, z, ok) && z == 12.75f && ok, "12.75 m, gecerli=1 cozuldu");
+        CHECK(lps::decodeEkfAlt(r.got[2].second, z, ok) && z == 3.5f && !ok, "3.5 m, gecerli=0 -> gecersiz");
+        CHECK(!lps::decodeEkfAlt(std::vector<uint8_t>{1, 2, 3}, z, ok), "yanlis yuk boyu reddedildi");
+        auto n = frame(std::nanf(""), 1);
+        CHECK(!lps::decodeEkfAlt(std::vector<uint8_t>(n.begin() + 4, n.begin() + 9), z, ok), "NaN reddedildi");
     }
 
     std::printf("rastgele gurultu (20 MB) -> yanlis KAPAT yok\n");

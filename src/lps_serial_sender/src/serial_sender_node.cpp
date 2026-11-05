@@ -660,6 +660,13 @@ public:
         poweroff_enable_ = declare_parameter<bool>("autopilot_poweroff_enable", true);
         poweroff_cmd_    = declare_parameter<std::string>("poweroff_command", "/usr/bin/systemctl poweroff");
 
+        // Otopilot -> Jetson: 0x4A EKF yuksekligi (05_11). Sadece gecerli=1 iken yayinlanir;
+        // car_detector boy filtresi + IR/EO gecisi icin HRVS'ten once bunu kullanir (EKF baro +
+        // LRF + HRVS birlestirir, HRVS kopunca da gelir). RX thread'inden ONCE olusturulmali.
+        ekf_alt_pub_ = create_publisher<sensor_msgs::msg::Range>(
+            declare_parameter<std::string>("ekf_altitude_topic", "/autopilot/ekf_altitude"),
+            rclcpp::SensorDataQoS());
+
         tag_sub_ = create_subscription<
             isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>(
             tag_topic_, rclcpp::SensorDataQoS(),
@@ -1574,6 +1581,7 @@ private:
 
     void onAutopilotMsg(uint8_t id, const std::vector<uint8_t> &p)
     {
+        if (id == lps::AP_MSG_EKF_ALT) { onEkfAlt(p); return; }
         if (id != lps::AP_MSG_POWEROFF) {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
                 "[SERIAL-RX] otopilot mesaji id=0x%02X %zu B (islenmiyor)", id, p.size());
@@ -1595,6 +1603,33 @@ private:
             RCLCPP_ERROR(get_logger(), "[SERIAL-RX] kapatma komutu basarisiz (rc=%d), sonraki KAPAT'ta tekrar", rc);
             poweroff_requested_ = false;
         }
+    }
+
+    /* 0x4A: EKF yuksekligi -> /autopilot/ekf_altitude (sadece gecerli=1). Gecersizken
+       yayin kesilir -> car_detector bayat sayip HRVS'e duser. */
+    void onEkfAlt(const std::vector<uint8_t> &p)
+    {
+        float z = 0; bool valid = false;
+        if (!lps::decodeEkfAlt(p, z, valid)) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "[SERIAL-RX] EKF yukseklik mesaji bozuk (yuk %zu B, 5 bekleniyordu ya da NaN) -> yok sayildi",
+                p.size());
+            return;
+        }
+        ++ekf_alt_frames_;
+        if (!valid) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "[SERIAL-RX] EKF yuksekligi GECERSIZ (gecerli=0, z=%.2f m) -> yayinlanmiyor, car_detector HRVS kullanir", z);
+            return;
+        }
+        sensor_msgs::msg::Range m;
+        m.header.stamp    = now();
+        m.header.frame_id = "ekf";
+        m.min_range = 0.0f; m.max_range = 1000.0f;
+        m.range     = z;
+        ekf_alt_pub_->publish(m);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+            "[SERIAL-RX] EKF yuksekligi %.2f m (toplam %llu mesaj)", z, (unsigned long long)ekf_alt_frames_);
     }
 
     /* -------------------------------------------------------------- */
@@ -1872,6 +1907,8 @@ private:
 
     /* RX thread - otopilot -> Jetson (0x49 KAPAT) */
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
+    rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ekf_alt_pub_;   // otopilot 0x4A (RX thread)
+    uint64_t ekf_alt_frames_ = 0;   // sadece RX thread'i yazar/okur
 
     std::thread           rx_thread_;
     std::atomic<bool>     rx_running_{true};

@@ -8,6 +8,10 @@
  *
  * Otopilottan gelen (02_11):
  *   0x49 KAPAT, 1 B yuk: 01 = Jetson'i kapat  ->  BB 49 01 FB 01 FF
+ * Otopilottan gelen (05_11):
+ *   0x4A EKF YUKSEKLIGI, 5 B yuk: float ekfZ [m] (little-endian) + uint8 gecerli
+ *        (1: EKF dikey kanal hazir). Header BB 4A 05 F6. GDNS EKF'i baro + LRF +
+ *        bizim gonderdigimiz HRVS'i birlestirir -> HRVS kopsa da yukseklik gelir.
  *
  * Bayt akisi parca parca gelebilir; ayristirici her bayti tamponlar, header ya da
  * yuk checksum'i tutmazsa SADECE bir bayt atlayip yeniden senkron arar (bozuk bir
@@ -15,8 +19,10 @@
  */
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <vector>
@@ -25,6 +31,19 @@ namespace lps {
 
 constexpr uint8_t AP_SYNC_BYTE   = 0xBB;
 constexpr uint8_t AP_MSG_POWEROFF = 0x49;
+constexpr uint8_t AP_MSG_EKF_ALT  = 0x4A;
+
+/** 0x4A yukunu coz. Yuk boyu yanlis ya da deger sonlu degilse false. */
+inline bool decodeEkfAlt(const std::vector<uint8_t> &p, float &z_m, bool &valid)
+{
+    if (p.size() != 5) return false;
+    float z;
+    std::memcpy(&z, p.data(), sizeof(z));   // Jetson ve otopilot little-endian
+    if (!std::isfinite(z)) return false;
+    z_m = z;
+    valid = p[4] == 1;
+    return true;
+}
 
 inline uint8_t apChecksum(const uint8_t *p, size_t n)
 {
