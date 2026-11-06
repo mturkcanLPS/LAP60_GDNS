@@ -22,12 +22,19 @@ namespace lps {
  *  ve ucus-kritik imgCb icinde donuyor; ayrica circularity filtresi 3-5 px'lik
  *  uzak LED'lerde guvenilmez (4piA/P^2 o boyutta gurultulu) — ikisinden de
  *  kacinildi. Doygun blob'da yogunluk-agirlikli centroid ek dogruluk vermez
- *  (tum pikseller 255) -> ikili maske centroid'i zaten optimal, ~0.3 px. */
-void detectIrBlobs(const cv::Mat &gray, double thresh,
+ *  (tum pikseller 255) -> ikili maske centroid'i zaten optimal, ~0.3 px.
+ *
+ *  Yuvarlaklik (06_11): round_min_area > 0 ise bu alandan BUYUK blob'larda
+ *  doluluk (alan / kutu) >= min_fill ve en/boy <= max_aspect aranir. LED doygun
+ *  dairesi 0.60-0.75 / ~1.0 (1.5-4 m olculdu); huni/vinil parlamasi 0.3-0.4 / 2-2.5.
+ *  Kucuk blob'larda (birkac px) sekil olculemez -> filtre uygulanmaz. */
+inline void detectIrBlobs(const cv::Mat &gray, double thresh,
                           double min_area, double max_area, int max_blobs,
                           cv::Mat &bin, cv::Mat &labels, cv::Mat &stats,
                           cv::Mat &centroids, std::vector<cv::Point2f> &out,
-                          std::vector<int> &out_area)
+                          std::vector<int> &out_area,
+                          double round_min_area = 0.0, double min_fill = 0.55,
+                          double max_aspect = 1.6)
 {
     out.clear();
     out_area.clear();
@@ -39,6 +46,13 @@ void detectIrBlobs(const cv::Mat &gray, double thresh,
     for (int i = 1; i < n; ++i) {
         const int a = stats.at<int>(i, cv::CC_STAT_AREA);
         if (a < min_area || a > max_area) continue;
+        if (round_min_area > 0 && a > round_min_area) {
+            const int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
+            const int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+            const double fill = (double)a / ((double)w * h);
+            const double asp  = (double)std::max(w, h) / std::max(1, std::min(w, h));
+            if (fill < min_fill || asp > max_aspect) continue;
+        }
         cand.emplace_back(a, i);
     }
     // Ucgen aramasi O(n^3): esik dusuk/sahne parlaksa yuzlerce aday cikip
@@ -69,11 +83,18 @@ void detectIrBlobs(const cv::Mat &gray, double thresh,
  *
  *  out_k   = oturan olcek (px/m); Z = f_px / out_k
  *  out_err = kenar basina ORTALAMA goreli artik -> tol_frac dogrudan
- *            "her kenar %X icinde" diye okunur. */
-bool findIrRightTriangle(const std::vector<cv::Point2f> &pts,
+ *            "her kenar %X icinde" diye okunur.
+ *
+ *  k_min/k_max (06_11): irtifa biliniyorsa beklenen olcek araligi (px/m). Bunun
+ *  DISINDAKI uclu SECIMDE atlanir. Eskiden en kucuk hatali uclu secilip olcek SONRA
+ *  kontrol ediliyordu; parlak sahnede rastgele bir uclu gercek LED'lerden daha dusuk
+ *  hata alip kazaniyor, sonra Z kontroluyle reddediliyordu -> gercek ucgen kayboluyordu. */
+inline bool findIrRightTriangle(const std::vector<cv::Point2f> &pts,
                                  float leg_a_m, float leg_b_m, float tol_frac,
                                  int &idx_r, int &idx_a, int &idx_b,
-                                 float &out_err, float &out_k)
+                                 float &out_err, float &out_k,
+                                 float k_min = 0.0f,
+                                 float k_max = std::numeric_limits<float>::max())
 {
     const int n = (int)pts.size();
     if (n < 3) return false;
@@ -108,6 +129,7 @@ bool findIrRightTriangle(const std::vector<cv::Point2f> &pts,
         if (sum_s < 3.0f) continue;           // dejenere/cakisik noktalar
 
         const float kk = sum_s / sum_e;       // en iyi oturan olcek (px/m)
+        if (kk < k_min || kk > k_max) continue;   // irtifayla tutarsiz boyut
         float err = 0.0f;
         for (int m = 0; m < 3; ++m) err += std::fabs(s[m] - kk * e[m]) / (kk * e[m]);
         err /= 3.0f;
@@ -122,6 +144,38 @@ bool findIrRightTriangle(const std::vector<cv::Point2f> &pts,
     out_err = best_err;
     out_k   = best_k;
     return found && best_err < tol_frac;
+}
+
+/** Huni merkezinin goruntudeki yeri (06_11). Ucgen ikizkenar DEGIL (R-sol 131 cm,
+ *  R-sag 144.5 cm) ve hipotenus ortasi huni merkezinden ~10 cm kayik. Kullanici olcusu:
+ *  merkez R'den kisa kenar boyunca on_short_m, uzun kenar boyunca on_long_m (0.655 / 0.617;
+ *  R'ye ve sol LED'e 90 cm, sag LED'e 105.5 cm -> 105.56 hesap). Kenarlar goruntude kisa/uzun
+ *  diye ayrilir; oran ambig_ratio'dan kucukse (egimde kisalma kenarlari karistirabilir) ayrim
+ *  guvenilmez -> hipotenus ortasi (eski davranis; yanlis atama 14 cm, orta nokta 10 cm hata).
+ *  Afin yaklasim: marker duzlemi kameraya gore az egik ve uzakta (>=1.5 m). */
+inline cv::Point2f irMarkerCenter(const cv::Point2f &R, const cv::Point2f &a, const cv::Point2f &b,
+                                  float leg_short_m, float leg_long_m,
+                                  float on_short_m, float on_long_m, float ambig_ratio,
+                                  bool &used_legs)
+{
+    const float la = (float)cv::norm(a - R), lb = (float)cv::norm(b - R);
+    const float hi = std::max(la, lb), lo = std::max(1e-3f, std::min(la, lb));
+    used_legs = leg_short_m > 0 && leg_long_m > leg_short_m && hi / lo >= ambig_ratio;
+    if (!used_legs) return (a + b) * 0.5f;
+    const cv::Point2f S = (la < lb) ? a : b;   // kisa kenarin ucu (sol LED)
+    const cv::Point2f L = (la < lb) ? b : a;   // uzun kenarin ucu (sag LED)
+    return R + (S - R) * (on_short_m / leg_short_m) + (L - R) * (on_long_m / leg_long_m);
+}
+
+/** Irtifaya gore beklenen LED blob alani (px, esik 240 ustu). 06_11 vincle olculdu
+ *  (infra1, 1.5-4 m, optik Z): medyan 754 @1.75, 723 @2.25, 586 @2.75, 506 @3.25,
+ *  478 @3.75 m -> alan ~ 750 * (1.75/Z)^0.6. Doygun halenin boyu 1/Z^2 ile DEGIL cok
+ *  daha yavas kuculur (pozlama/parlaklik). 4 m ustu OLCULMEDI -> alt sinir orada
+ *  uygulanmaz (cagiran taraf). */
+inline double irLedAreaExpected(double z_m, double ref_area, double ref_z, double expo)
+{
+    if (!(z_m > 0.1)) return ref_area;
+    return ref_area * std::pow(ref_z / z_m, expo);
 }
 
 

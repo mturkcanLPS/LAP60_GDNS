@@ -487,18 +487,27 @@ public:
         // testi saglam marjla calisir. Iki kenar esit oldugu icin a/b eslesme
         // belirsizligi tamamen anlamsiz (konumu zaten etkilemiyordu).
         ir_enabled_    = declare_parameter<bool>  ("ir_enabled",     true);
-        ir_leg_a_m_    = (float)declare_parameter<double>("ir_leg_a_m",    1.36);
-        ir_leg_b_m_    = (float)declare_parameter<double>("ir_leg_b_m",    1.36);
+        ir_leg_a_m_    = (float)declare_parameter<double>("ir_leg_a_m",    1.445);
+        ir_leg_b_m_    = (float)declare_parameter<double>("ir_leg_b_m",    1.31);
         // 0.12: sentetik testle olculdu (test_ir_triangle). Mesru tespitlerin
         // fit artigi 30 derece egimde bile 0.074; ESKENAR ucgen ise 0.157 alir.
         // Eski 0.25 degeri eskenar ucgeni KABUL ediyordu - olcek-bagimsiz
         // dogrulama mutlak-olcek kontrolunden zayif oldugu icin daha siki olmali.
         ir_tol_frac_   = (float)declare_parameter<double>("ir_tol_frac",   0.12);
+        // Huni merkezi LED'lere gore (06_11 kullanici olcusu): R'den kisa kenar (sol LED)
+        // boyunca 0.655 m, uzun kenar (sag LED) boyunca 0.617 m. Hipotenus ortasi merkezden
+        // ~10 cm kayikti (tag'lerle olculdu); bu degerlerle 2 karede 1.4 / 1.8 cm.
+        // Goruntude kenar orani < ir_leg_ambig_ratio ise hipotenus ortasina duser.
+        ir_center_on_short_m_ = (float)declare_parameter<double>("ir_center_on_short_m", 0.655);
+        ir_center_on_long_m_  = (float)declare_parameter<double>("ir_center_on_long_m",  0.617);
+        ir_leg_ambig_ratio_   = (float)declare_parameter<double>("ir_leg_ambig_ratio",   1.03);
         // Optik Z ile radar Z arasinda izin verilen goreli fark. Gevsek tutuldu:
         // amac hassas kalibrasyon degil, kabaca yanlis olcekteki sahte eslesmeyi
         // elemek (radar 10 Hz + bayat oldugu icin sikilastirmak dogru eslesmeleri
         // atmaya baslar). Radar yoksa kontrol tamamen atlanir.
-        ir_z_tol_      = (float)declare_parameter<double>("ir_z_tol",      0.50);
+        // 06_11: 0.25 (vinc testi: dogru ucgen 0.90-0.93, LED+lamba sahtesi 1.39/0.70).
+        // Irtifa tazeyken ucgen SECIMI de bu aralikla sinirli (ir_triangle k_min/k_max).
+        ir_z_tol_      = (float)declare_parameter<double>("ir_z_tol",      0.25);
         // Sahte ucgen kurallari (02_11; gece LED testinde yeniden ayarlanacak).
         // A: <= bu kadar parlak nokta varsa degerlendir (gece 3 LED + birkac lamba).
         ir_max_blobs_valid_ = declare_parameter<int>("ir_max_blobs_valid", 6);
@@ -519,6 +528,37 @@ public:
         // LED'ler icin kisilamaz (sahne kararir, ikisi de coker). Kameraya bakan
         // aktif LED normal pozlamada da doygun (255), sahne degil -> ayrim burada.
         ir_min_thresh_ = declare_parameter<double>("ir_min_threshold", 240.0);
+
+        // IRTIFAYA GORE LED ayari (06_11 vinc testi). Sabit 400 px ust sinir LED'leri
+        // ~3 m altinda eliyordu (2.4 m'de 663-723 px), yerlerine huni parlamasi kiriktilari
+        // ucgene giriyordu. Irtifa tazeyse:
+        //   - beklenen LED alani A(Z) = ref * (ref_z/Z)^exp  (olculen: 750, 1.75 m, 0.6)
+        //   - alan penceresi [A/lo_div, A*hi]; alt sinir sadece Z <= model_max_z (olculen
+        //     aralik 1.5-4 m; ustunde alt sinir ir_min_area, yani eski davranis)
+        //   - ucgen SECIMI beklenen olcekle (Z +- ir_z_tol) sinirli
+        // Irtifa yoksa: [ir_min_area, ir_noalt_max_area] (B kurali zaten gecersiz sayar).
+        // Kaynak (ir_alt_source): auto = EKF (otopilot 0x4A), yoksa HRVS | ekf | hrvs |
+        // tag = AprilTag avgPos z (SADECE yer testi: radar tavani okur; ucusta KULLANMA).
+        ir_alt_source_     = declare_parameter<std::string>("ir_alt_source", "auto");
+        ir_area_ref_       = declare_parameter<double>("ir_led_area_ref",    750.0);
+        ir_area_ref_z_     = declare_parameter<double>("ir_led_area_ref_z",  1.75);
+        ir_area_exp_       = declare_parameter<double>("ir_led_area_exp",    0.6);
+        ir_area_hi_        = declare_parameter<double>("ir_led_area_hi",     2.5);
+        ir_area_lo_div_    = declare_parameter<double>("ir_led_area_lo_div", 6.0);
+        ir_area_model_max_z_ = declare_parameter<double>("ir_led_area_model_max_z", 5.0);
+        ir_noalt_max_area_ = declare_parameter<double>("ir_noalt_max_area", 2500.0);
+        // Yuvarlaklik: bu alandan buyuk blob'larda doluluk/en-boy sarti (LED 0.60-0.75 / ~1.0,
+        // huni parlamasi 0.3-0.4 / 2-2.5).
+        ir_round_min_area_ = declare_parameter<double>("ir_round_min_area",  30.0);
+        ir_round_min_fill_ = declare_parameter<double>("ir_round_min_fill",  0.55);
+        ir_round_max_asp_  = declare_parameter<double>("ir_round_max_aspect", 1.6);
+        if (ir_alt_source_ != "auto" && ir_alt_source_ != "ekf" &&
+            ir_alt_source_ != "hrvs" && ir_alt_source_ != "tag") {
+            RCLCPP_WARN(get_logger(), "ir_alt_source '%s' bilinmiyor -> auto", ir_alt_source_.c_str());
+            ir_alt_source_ = "auto";
+        }
+        if (ir_alt_source_ == "tag")
+            RCLCPP_WARN(get_logger(), "IR irtifa kaynagi = AprilTag z (YER TESTI modu, ucusta kullanma)");
         camera_info_topic_ = declare_parameter<std::string>(
             "camera_info_topic", "/camera/camera/infra1/camera_info");
 
@@ -807,6 +847,10 @@ private:
         const lps::TagFusion f = lps::fuseTags(lps::toTagDets(*msg), apriltag_node_size_);
         apriltagPack_t ap = packFromFusion(f, msSinceStart());
         subtractCamOffset(ap, cam_off1_);   // -> platform merkezine gore
+        if (f.valid && f.pos[2] > 0.1f) {   // IR irtifa kaynagi 'tag' (yer testi)
+            tag_z_m_.store(f.pos[2]);
+            tag_z_ms_.store(msSinceStart());
+        }
 
         // Video overlay: huni tag'lerinin (duvar+kucuk) kose koordinatlari.
         std::vector<lps::DebugRecorder::TagOverlay> overlays;
@@ -907,6 +951,28 @@ private:
     /*   4) undistort - normalize - Z ile olcekle (kamera optik frame'i,  */
     /*      AprilTag avgPos ile ayni konvansiyon)                       */
     /* -------------------------------------------------------------- */
+    /* IR icin irtifa: ir_alt_source'a gore. auto = EKF (otopilot 0x4A) tazeyse o, yoksa
+       HRVS. 'tag' sadece yer testi (radar tavan okur). Tazelik ir_radar_stale_ms. */
+    struct IrAlt { float z = 0.0f; bool fresh = false; const char *src = "-"; };
+    IrAlt irAltitude(uint32_t now_ms)
+    {
+        auto fresh = [&](uint32_t t) { return t != 0 && now_ms - t <= ir_radar_stale_ms_; };
+        IrAlt a;
+        const std::string &s = ir_alt_source_;
+        if (s == "tag") {
+            if (fresh(tag_z_ms_.load())) { a.z = tag_z_m_.load(); a.fresh = true; a.src = "TAG"; }
+            return a;
+        }
+        if (s == "auto" || s == "ekf") {
+            if (fresh(ekf_alt_ms_.load())) { a.z = ekf_alt_m_.load(); a.fresh = true; a.src = "EKF"; return a; }
+            if (s == "ekf") return a;
+        }
+        float zr;
+        { std::lock_guard<std::mutex> lk(hrvs_mutex_); zr = hrvs_data_.altitude / 100.0f; }
+        if (zr > 0.05f && fresh(hrvs_last_ms_.load())) { a.z = zr; a.fresh = true; a.src = "HRVS"; }
+        return a;
+    }
+
     void processIr(const cv::Mat &frame)
     {
         cv::Matx33d K; cv::Mat D;
@@ -916,35 +982,56 @@ private:
             K = cam_K_; D = cam_D_;
         }
 
-        // Radar SADECE capraz kontrol icin - olcek artik ucgenin kendisinden.
+        // Irtifa SADECE capraz kontrol + arama penceresi icin - olcek ucgenin kendisinden.
         // (Radar 10 Hz, kamera 30 Hz: eskiden 3 karenin 2'si bayat Z kullaniyordu.)
-        float Z_radar;
-        { std::lock_guard<std::mutex> lk(hrvs_mutex_); Z_radar = hrvs_data_.altitude / 100.0f; }
+        const uint32_t now_ms = msSinceStart();
+        const IrAlt alt = irAltitude(now_ms);
+        const float Z_alt = alt.fresh ? alt.z : 0.0f;
 
-        lps::detectIrBlobs(frame, ir_min_thresh_, ir_min_area_, ir_max_area_,
+        // Irtifaya gore LED alan penceresi + beklenen olcek (06_11)
+        double a_lo = ir_min_area_, a_hi = ir_noalt_max_area_;
+        float  k_min = 0.0f, k_max = std::numeric_limits<float>::max();
+        const double f_px = 0.5 * (K(0, 0) + K(1, 1));
+        if (alt.fresh) {
+            const double A = lps::irLedAreaExpected(Z_alt, ir_area_ref_, ir_area_ref_z_, ir_area_exp_);
+            a_hi = std::max(ir_max_area_, A * ir_area_hi_);
+            if (Z_alt <= ir_area_model_max_z_) a_lo = std::max(ir_min_area_, A / ir_area_lo_div_);
+            k_min = (float)(f_px / (Z_alt * (1.0f + ir_z_tol_)));
+            if (ir_z_tol_ < 0.95f) k_max = (float)(f_px / (Z_alt * (1.0f - ir_z_tol_)));
+        }
+
+        lps::detectIrBlobs(frame, ir_min_thresh_, a_lo, a_hi,
                       kIrMaxBlobs, ir_bin_, ir_labels_, ir_stats_, ir_centroids_,
-                      ir_pts_, ir_areas_);
+                      ir_pts_, ir_areas_,
+                      ir_round_min_area_, ir_round_min_fill_, ir_round_max_asp_);
 
         irPack_t ir{};
-        ir.timeStamp = msSinceStart();
+        ir.timeStamp = now_ms;
         lps::DebugRecorder::IrOverlay ov;
         ov.n_blobs = (int)ir_pts_.size();
-        ov.blobs   = ir_pts_;   // <=16 nokta; eslesme olmasa da videoda gorunur
-        ov.no_alt  = (Z_radar <= 0.05f);   // capraz kontrol yok (IR yine calisir)
+        ov.no_alt  = !alt.fresh;   // capraz kontrol yok
+        ov.alt_src = alt.src;
+        ov.z_radar = Z_alt;
+        ov.area_lo = (int)std::lround(a_lo);
+        ov.area_hi = (int)std::lround(a_hi);
 
         int i_right, i_a, i_b;
         float fit_err = 0.0f, k_px_per_m = 0.0f;
-        const double f_px = 0.5 * (K(0, 0) + K(1, 1));
         if (lps::findIrRightTriangle(ir_pts_, ir_leg_a_m_, ir_leg_b_m_, ir_tol_frac_,
-                                i_right, i_a, i_b, fit_err, k_px_per_m)) {
+                                i_right, i_a, i_b, fit_err, k_px_per_m, k_min, k_max)) {
             // Z ucgenin OLCULEN buyuklugunden: Z = f / k. Kamera hiziyla (30 Hz)
             // guncellenir, bayat degildir ve OPTIK EKSEN derinligidir - pinhole
             // geri izdusumun istedigi buyuklugun ta kendisi (radar dikey verir).
             const float Z_m = (float)f_px / k_px_per_m;
             ov.z       = Z_m;
-            ov.z_radar = Z_radar;
 
-            const cv::Point2f mid = (ir_pts_[i_a] + ir_pts_[i_b]) * 0.5f;
+            // Huni merkezi (06_11): hipotenus ortasi DEGIL, olculen yerlesim (irMarkerCenter).
+            bool legs_ok = false;
+            const cv::Point2f mid = lps::irMarkerCenter(
+                ir_pts_[i_right], ir_pts_[i_a], ir_pts_[i_b],
+                std::min(ir_leg_a_m_, ir_leg_b_m_), std::max(ir_leg_a_m_, ir_leg_b_m_),
+                ir_center_on_short_m_, ir_center_on_long_m_, ir_leg_ambig_ratio_, legs_ok);
+            ov.legs_ok = legs_ok;
             ov.cand   = true;
             ov.pts[0] = ir_pts_[i_right];
             ov.pts[1] = ir_pts_[i_a];
@@ -955,20 +1042,19 @@ private:
             // parlak nokta uretir, 560 ucluden tesadufi dik ucgen cikar (gunduz
             // ucuslarinda 4718 sahte gecerli kare). Kayitlarla tekrar oynatma:
             // A+B+D sahtelerin %99'unu eler. Esikler gece LED testinde ayarlanacak.
-            //   A) kalabalik sahne   B) radar yok/bayat (eskiden kontrol ATLANIYORDU)
-            //   Z) optik Z radarla uyusmuyor   D) konum ardisik karelerde kararsiz
-            const uint32_t now_ms = msSinceStart();
-            const uint32_t rl = hrvs_last_ms_.load();
-            const bool radar_ok = Z_radar > 0.05f && rl != 0 && now_ms - rl <= ir_radar_stale_ms_;
+            //   A) kalabalik sahne   B) irtifa yok/bayat (eskiden kontrol ATLANIYORDU)
+            //   Z) optik Z irtifayla uyusmuyor   D) konum ardisik karelerde kararsiz
+            // 06_11: A, irtifa penceresinden GECEN blob'lari sayar (parlama kiriktilari
+            // pencere disinda kalir). Z, irtifa tazeyken secimde zaten saglanir (k_min/k_max).
             const char *red = nullptr;
             if ((int)ir_pts_.size() > ir_max_blobs_valid_)       red = "kalabalik sahne";
-            else if (ir_require_radar_ && !radar_ok)             red = "radar yok/bayat";
-            else if (Z_radar > 0.05f &&
-                     std::fabs(Z_m - Z_radar) / Z_radar > ir_z_tol_) {
-                red = "Z radarla uyusmuyor";
+            else if (ir_require_radar_ && !alt.fresh)            red = "irtifa yok/bayat";
+            else if (Z_alt > 0.05f &&
+                     std::fabs(Z_m - Z_alt) / Z_alt > ir_z_tol_) {
+                red = "Z irtifayla uyusmuyor";
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-                    "[IR] optik Z=%.2f m radar Z=%.2f m ile uyusmuyor (tol %.0f%%) "
-                    "- tespit reddedildi", Z_m, Z_radar, ir_z_tol_ * 100.0f);
+                    "[IR] optik Z=%.2f m %s Z=%.2f m ile uyusmuyor (tol %.0f%%) "
+                    "- tespit reddedildi", Z_m, alt.src, Z_alt, ir_z_tol_ * 100.0f);
             }
             if (!red) {
                 ir_run_ = (ir_run_ > 0 && cv::norm(mid - ir_last_mid_) <= ir_max_jump_px_)
@@ -1499,14 +1585,16 @@ private:
                     // amin: eslesen en kucuk blob alani (menzil sinir gostergesi).
                     RCLCPP_INFO(get_logger(),
                         "[IR]        valid=%s yon(%+.4f,%+.4f) [Zopt=%.2f -> "
-                        "%+.2f,%+.2f m] Zrad=%.2f | blob=%d amin=%dpx fit_err=%.2f%s",
+                        "%+.2f,%+.2f m] Z%s=%.2f | blob=%d amin=%dpx fit_err=%.2f LED %d-%dpx%s%s",
                         ir_copy.valid ? "Y" : "N",
                         ir_copy.irpos.x, ir_copy.irpos.y, ir_ov_copy.z,
                         ir_copy.irpos.x * ir_ov_copy.z,
                         ir_copy.irpos.y * ir_ov_copy.z,
-                        ir_ov_copy.z_radar,
+                        ir_ov_copy.alt_src, ir_ov_copy.z_radar,
                         ir_ov_copy.n_blobs, ir_ov_copy.min_area, ir_ov_copy.fit_err,
-                        ir_ov_copy.no_alt ? " [radar yok]" : "");
+                        ir_ov_copy.area_lo, ir_ov_copy.area_hi,
+                        ir_ov_copy.no_alt ? " [irtifa yok]" : "",
+                        ir_ov_copy.reason ? (std::string(" RED:") + ir_ov_copy.reason).c_str() : "");
                 }
             }
         }
@@ -1621,6 +1709,10 @@ private:
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                 "[SERIAL-RX] EKF yuksekligi GECERSIZ (gecerli=0, z=%.2f m) -> yayinlanmiyor, car_detector HRVS kullanir", z);
             return;
+        }
+        if (z > 0.1f) {                    // IR irtifa kaynagi (auto/ekf)
+            ekf_alt_m_.store(z);
+            ekf_alt_ms_.store(msSinceStart());
         }
         sensor_msgs::msg::Range m;
         m.header.stamp    = now();
@@ -1959,9 +2051,10 @@ private:
     /* ---- IR LED dik ucgeni ---- */
     static constexpr int kIrMaxBlobs = 16;   // C(16,3)=560 kombinasyon - ucuz
     bool        ir_enabled_ = true;
-    float       ir_leg_a_m_ = 1.36f, ir_leg_b_m_ = 1.36f;
+    float       ir_leg_a_m_ = 1.445f, ir_leg_b_m_ = 1.31f;   // 06_11 olculen (R-sag / R-sol)
     float       ir_tol_frac_ = 0.12f;
-    float       ir_z_tol_    = 0.50f;   // optik Z vs radar Z kaba capraz kontrol
+    float       ir_center_on_short_m_ = 0.655f, ir_center_on_long_m_ = 0.617f, ir_leg_ambig_ratio_ = 1.03f;
+    float       ir_z_tol_    = 0.25f;   // optik Z vs irtifa (06_11: 0.50 -> 0.25)
     // Sahte ucgen kurallari (02_11, processIr): A/B/D
     int         ir_max_blobs_valid_ = 6;      // A: daha kalabalik sahne -> gecersiz
     bool        ir_require_radar_   = true;   // B: radar yok/bayat -> gecersiz
@@ -1972,6 +2065,16 @@ private:
     cv::Point2f ir_last_mid_;
     std::atomic<uint32_t> hrvs_last_ms_{0};   // son yeni radar karesi (msSinceStart); 0 = hic
     double      ir_min_area_ = 1.0, ir_max_area_ = 400.0, ir_min_thresh_ = 240.0;
+    // Irtifaya gore LED penceresi (06_11) + irtifa kaynagi
+    std::string ir_alt_source_ = "auto";
+    double      ir_area_ref_ = 750.0, ir_area_ref_z_ = 1.75, ir_area_exp_ = 0.6;
+    double      ir_area_hi_ = 2.5, ir_area_lo_div_ = 6.0, ir_area_model_max_z_ = 5.0;
+    double      ir_noalt_max_area_ = 2500.0;
+    double      ir_round_min_area_ = 30.0, ir_round_min_fill_ = 0.55, ir_round_max_asp_ = 1.6;
+    std::atomic<float>    ekf_alt_m_{0.0f};   // otopilot 0x4A (gecerli=1), RX thread yazar
+    std::atomic<uint32_t> ekf_alt_ms_{0};     // msSinceStart; 0 = hic
+    std::atomic<float>    tag_z_m_{0.0f};     // infra1 huni fuzyonu z (yer testi kaynagi)
+    std::atomic<uint32_t> tag_z_ms_{0};
     std::string camera_info_topic_;
     // Tespit scratch'i - sadece imgCb thread'inden kullanilir, her karede
     // yeniden tahsis olmasin diye uye (LPS'deki small_/canvas_ ile ayni desen).

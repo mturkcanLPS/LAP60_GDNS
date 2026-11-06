@@ -91,15 +91,15 @@ public:
         float       z = 0;            // ucgenden olculen OPTIK menzil; pakete
                                       // GITMIYOR — dogrulama + HUD'da metrik
                                       // karsiligi gostermek icin
-        float       z_radar = 0;      // ayni andaki HRVS altitude — karsilastirma
+        float       z_radar = 0;      // ayni andaki IRTIFA (kaynak alt_src) — karsilastirma
+        const char *alt_src = "-";    // 06_11: EKF / HRVS / TAG / - (yok)
+        int         area_lo = 0, area_hi = 0;   // irtifaya gore LED alan penceresi (px)
+        bool        legs_ok = false;  // merkez olculen yerlesimle (true) / hipotenus ortasi (false)
         // Geometriye uyan ama GECERSIZ sayilan aday (02_11 gunduz sahte ucgen kurallari):
         // videoda kirmizi cizilir, sebep HUD'da — gece testinde esik ayari icin.
         bool        cand = false;     // pts/mid dolu (gecerli ya da reddedilmis aday)
         const char *reason = nullptr; // nullptr = gecerli; aksi halde red sebebi
         int         run = 0;          // ardisik kararli kare sayisi
-        // Esikten gecen TUM parlak noktalar (<=16). Ucgen eslesmese de cizilir:
-        // esik ayarinda 'nerede/neyi yakaladi' sorusu ancak boyle gorulur.
-        std::vector<cv::Point2f> blobs;
     };
 
     struct State {
@@ -251,12 +251,8 @@ private:
                         cv::FONT_HERSHEY_SIMPLEX, 0.55, GREEN, 2, cv::LINE_AA);
         }
 
-        // Esikten gecen tum parlak noktalar — ucgen eslesmese DE cizilir ki
-        // sahada esik ayarlarken neyin yakalandigi gorunsun (kirmizi kucuk daire).
-        for (const auto &b : st.ir.blobs)
-            cv::circle(img, cv::Point((int)(b.x * k), (int)(b.y * k)),
-                       4, RED, 1, cv::LINE_AA);
-
+        // 06_11 (kullanici): SADECE gecerli LED ucgeni cizilir. Tum parlak noktalar ve
+        // reddedilen aday artik cizilmiyor (gereksiz CPU); sebebi/sayisi HUD'da yaziyor.
         // IR LED dik ucgeni: her LED daire icinde, aralarina kenar cizgileri.
         // Dik acı kosesi (pts[0]) sari 'R'. Hipotenus orta noktasi = HUNI
         // MERKEZI, konum oradan cikiyor -> nisangah ile isaretli, dik acıdan
@@ -282,11 +278,6 @@ private:
             cv::circle(img, m, 11, CYAN, 2, cv::LINE_AA);
             cv::line(img, m + cv::Point(-16, 0), m + cv::Point(16, 0), CYAN, 1, cv::LINE_AA);
             cv::line(img, m + cv::Point(0, -16), m + cv::Point(0, 16), CYAN, 1, cv::LINE_AA);
-        } else if (st.ir.cand) {   // reddedilen aday: ince kirmizi ucgen
-            for (int i = 0; i < 3; ++i)
-                cv::line(img, cv::Point((int)(st.ir.pts[i].x * k), (int)(st.ir.pts[i].y * k)),
-                         cv::Point((int)(st.ir.pts[(i + 1) % 3].x * k), (int)(st.ir.pts[(i + 1) % 3].y * k)),
-                         RED, 1, cv::LINE_AA);
         }
 
         // Akis oku (merkezden; hover hareketleri gorunsun diye x15 buyutme)
@@ -325,20 +316,22 @@ private:
             std::snprintf(l3, sizeof(l3), "IR: bu kamerada hesaplanmiyor");
         else if (st.ir.valid)
             std::snprintf(l3, sizeof(l3),
-                "IR:OK  yon %+.4f %+.4f  [Zopt %.2f -> %+5.2f %+5.2f m]%s  "
-                "blob=%d amin=%dpx err=%.2f",
+                "IR:OK  yon %+.4f %+.4f  [Zopt %.2f -> %+5.2f %+5.2f m] %s %.2f  "
+                "blob=%d amin=%dpx LED %d-%dpx %s",
                 st.ir.x, st.ir.y, st.ir.z,
                 st.ir.x * st.ir.z, st.ir.y * st.ir.z,
-                st.ir.no_alt ? " (radar yok)" : "",
-                st.ir.n_blobs, st.ir.min_area, st.ir.fit_err);
+                st.ir.alt_src, st.ir.z_radar,
+                st.ir.n_blobs, st.ir.min_area, st.ir.area_lo, st.ir.area_hi,
+                st.ir.legs_ok ? "merkez:olcu" : "merkez:ORTA");
         else if (st.ir.cand && st.ir.reason)
             std::snprintf(l3, sizeof(l3),
-                "IR:RED  %-20s dizi=%d  Zopt %.2f radar %.2f  blob=%d err=%.2f",
-                st.ir.reason, st.ir.run, st.ir.z, st.ir.z_radar, st.ir.n_blobs, st.ir.fit_err);
+                "IR:RED  %-20s dizi=%d  Zopt %.2f %s %.2f  blob=%d err=%.2f LED %d-%dpx",
+                st.ir.reason, st.ir.run, st.ir.z, st.ir.alt_src, st.ir.z_radar, st.ir.n_blobs,
+                st.ir.fit_err, st.ir.area_lo, st.ir.area_hi);
         else
             std::snprintf(l3, sizeof(l3),
-                "IR:YOK  ucgen eslesmedi                blob=%d err=%.2f",
-                st.ir.n_blobs, st.ir.fit_err);
+                "IR:YOK  ucgen eslesmedi  %s %.2f  blob=%d LED %d-%dpx",
+                st.ir.alt_src, st.ir.z_radar, st.ir.n_blobs, st.ir.area_lo, st.ir.area_hi);
 
         cv::putText(img, l1, {6, 17}, cv::FONT_HERSHEY_SIMPLEX, 0.42,
                     st.tag_valid && !st.tag_stale ? WHITE : RED, 1, cv::LINE_AA);

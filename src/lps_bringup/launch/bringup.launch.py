@@ -179,6 +179,9 @@ def generate_launch_description():
     # Seri cikis. Olcum/masa testinde sahte porta (pty) yonlendirmek icin —
     # otopilota henuz tanimadigi paket gitmesin.
     serial_port_arg = DeclareLaunchArgument('serial_port', default_value='/dev/ttyTHS1')
+    # IR LED penceresi icin irtifa kaynagi (06_11): auto = EKF, yoksa HRVS (UCUS).
+    # tag = AprilTag z — SADECE yer/vinc testi (radar tavani okur). Ucusta auto kalmali.
+    ir_alt_source_arg = DeclareLaunchArgument('ir_alt_source', default_value='auto')
     CAMERA_FPS = ParameterValue(LaunchConfiguration('camera_fps'), value_type=float)
     # AprilTag'i her N. karede calistir (IKI kamerada da, AYNI karelerde). 1 = her
     # kare. VARSAYILAN 2 (28_09, olcum + kullanici onayi): tag iki kamerada sabit
@@ -468,23 +471,46 @@ def generate_launch_description():
             # calisma araligi ~2-15 m.
             'ir_enabled':        True,
             'camera_info_topic': '/camera/camera/infra1/camera_info',
-            'ir_leg_a_m':        1.36,
-            'ir_leg_b_m':        1.36,
+            # 06_11 kullanici olcumu: R (dik aci) - sag LED 144.5 cm, R - sol LED 131 cm
+            # (hipotenus 195.0). Goruntuyle dogrulandi: oran 1.114 vs 1.103, aci 89.3.
+            # Eski 1.36/1.36 ile fit_err hep 0.03-0.04 cikiyordu (esit olmayan kenarlar).
+            'ir_leg_a_m':        1.445,
+            'ir_leg_b_m':        1.31,
             # Sentetik testle secildi (ros2 run lps_serial_sender test_ir_triangle):
             # mesru tespit 30 derece egimde bile fit=0.074, ESKENAR ucgen 0.157.
             # 0.25 iken eskenar ucgen kabul ediliyordu.
             'ir_tol_frac':       0.12,   # kenar basina ORTALAMA goreli hata tavani
+            # Huni merkezi (06_11 kullanici olcusu: merkez R'ye ve sol LED'e 90 cm, sag LED'e
+            # 105.5 cm): R'den kisa kenar boyunca 0.655, uzun kenar boyunca 0.617 m.
+            # Hipotenus ortasi ~10 cm kayikti; kenar orani < 1.03 ise ona duser.
+            'ir_center_on_short_m': 0.655,
+            'ir_center_on_long_m':  0.617,
+            'ir_leg_ambig_ratio':   1.03,
             # Optik Z (Z = f/k, ucgenin piksel boyutundan) PAKETE GITMIYOR —
             # yanlis ucgen eslesmelerini elemek icin radar ile kiyaslanir ve
             # CSV'ye z_opt olarak yazilir. Dogrulama icin %10 dogruluk yeter,
             # optik Z bunu 40 derece egimde bile saglar.
-            'ir_z_tol':          0.50,   # optik Z ile radar Z arasi izin verilen fark
+            # 06_11: 0.50 -> 0.25. Vinc testinde dogru ucgen Zopt/irtifa 0.90-0.93; iki LED +
+            # odadaki yuvarlak lamba sahte ucgeni 1.39 ve 0.70 verdi, 0.50 ile GECERLI sayiliyordu.
+            # 0.25 ~35 derece egime kadar dogru ucgeni tutar (Zopt ~ h/cos).
+            'ir_z_tol':          0.25,   # optik Z ile irtifa arasi izin verilen fark (secimde de)
             # MENZILI BU BELIRLER: LED'in piksel izi 1/Z^2 ile kuculur, tespiti
             # sinirlayan ilk sey genelde esik degil bu alan tabanidir. 1 px =
             # en genis menzil; tek piksel gurultusunu ucgen geometrisi eliyor.
             # Videodaki 'amin=Npx' bu tabana ne kadar yaklasildigini gosterir.
             'ir_min_area':       1.0,
-            'ir_max_area':       400.0,
+            'ir_max_area':       400.0,   # 06_11: irtifa tazeyken ust sinir max(bu, 2.5*A(Z))
+            # Irtifaya gore LED penceresi (06_11 vinc testi, 1.5-4 m): A(Z)=750*(1.75/Z)^0.6
+            'ir_alt_source':     LaunchConfiguration('ir_alt_source'),
+            'ir_led_area_ref':   750.0,
+            'ir_led_area_ref_z': 1.75,
+            'ir_led_area_exp':   0.6,
+            'ir_led_area_hi':    2.5,
+            'ir_led_area_lo_div': 6.0,
+            'ir_led_area_model_max_z': 5.0,   # ustunde alt sinir yok (olculmedi)
+            'ir_round_min_area': 30.0,        # bundan buyuk blob yuvarlak olmali
+            'ir_round_min_fill': 0.55,
+            'ir_round_max_aspect': 1.6,
             # infra1'i AprilTag + optik akis da tuketiyor -> pozlama KISILAMAZ
             # (sahne kararir, ikisi de coker). Ayrim yuksek esikten gelir:
             # kameraya bakan aktif LED normal pozlamada da 255'e doygunlasir,
@@ -516,6 +542,7 @@ def generate_launch_description():
         camera_fps_arg,
         infra2_equal_arg,
         serial_port_arg,
+        ir_alt_source_arg,
         fastdds_shm_arg,
         apriltag_every_n_arg,
         set_fastdds_profile,     # node'lardan ONCE: hepsi (realsense dahil) ayni profili alsin

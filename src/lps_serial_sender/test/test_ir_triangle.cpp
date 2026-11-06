@@ -246,6 +246,88 @@ int main()
         check("Z=" + std::to_string((int)Z) + "m (1px LED)", {0,0,0}, t, 0, 0, 1);
     }
 
+    // --- 8) 06_11 vinc testi sorunlari: irtifaya gore pencere + yuvarlaklik + olcek ---
+    std::printf("\n[8] Alcakta buyuk LED + parlama (06_11 vinc testi)\n");
+    {
+        // 2.4 m: LED ~700 px (r=15), huni parlamasi uzun leke ~3800 px, kiriktilar 3-80 px
+        cv::Mat img = cv::Mat::zeros(IMG, CV_8UC1); img.setTo(cv::Scalar(30));
+        const cv::Point2f L[3] = {{494, 222}, {820, 112}, {935, 479}};
+        for (const auto &p : L) cv::circle(img, p, 15, cv::Scalar(255), -1);
+        cv::ellipse(img, cv::Point(701, 407), cv::Size(90, 30), 20, 0, 360, cv::Scalar(255), -1);
+        const cv::Point2f junk[] = {{634, 365}, {707, 300}, {745, 392}, {602, 41}, {672, 365}, {770, 560}};
+        for (const auto &j : junk) cv::circle(img, j, 2, cv::Scalar(255), -1);
+        cv::Mat bin, lab, st, cen; std::vector<cv::Point2f> pts; std::vector<int> ar;
+
+        lps::detectIrBlobs(img, 240.0, 1.0, 400.0, 16, bin, lab, st, cen, pts, ar);
+        int led_kept = 0;                         // eski sabit 400 px: LED'ler elenir
+        for (const auto &p : pts) for (const auto &l : L) if (cv::norm(p - l) < 3) ++led_kept;
+        const bool old_miss = led_kept == 0 && !pts.empty();
+        std::printf("  %s  %-34s blob=%zu (LED'ler 400 px'i asiyor)\n",
+                    old_miss ? "OK  " : "HATA", "eski pencere 1-400 px", pts.size());
+        if (!old_miss) ++failures;
+
+        // yeni: Z=2.43 -> A=750*(1.75/2.43)^0.6=617 -> [103, 1543], yuvarlaklik >30 px
+        const double A = lps::irLedAreaExpected(2.43, 750, 1.75, 0.6);
+        lps::detectIrBlobs(img, 240.0, std::max(1.0, A / 6), std::max(400.0, A * 2.5), 16,
+                           bin, lab, st, cen, pts, ar, 30.0, 0.55, 1.6);
+        int ir_, ia, ib; float err = 0, k = 0;
+        const bool f = lps::findIrRightTriangle(pts, LEG_A, LEG_B, TOL, ir_, ia, ib, err, k);
+        const bool ok = pts.size() == 3 && f && std::fabs(647.5f / k - 2.43f) < 0.25f;
+        std::printf("  %s  %-34s blob=%zu ucgen=%d Zopt=%.2f (pencere %.0f-%.0f px)\n",
+                    ok ? "OK  " : "HATA", "yeni pencere + yuvarlaklik", pts.size(), (int)f,
+                    k > 0 ? 647.5f / k : 0.f, A / 6, A * 2.5);
+        if (!ok) ++failures;
+    }
+    std::printf("\n[9] Olcek SECIMDE: kusursuz ama yanlis olcekli sahte ucgen\n");
+    {
+        // gercek LED'ler Z=4 m'de (k=f/Z=162 px/m), hafif bozuk (fit ~0.04);
+        // sahte uclu kusursuz dik ikizkenar ama Z=12 m olceginde.
+        const float kr = 647.5f / 4.0f, ks = 647.5f / 12.0f;
+        std::vector<cv::Point2f> pts = {
+            {300, 200}, {300 + LEG_A * kr * 1.06f, 200}, {300, 200 + LEG_B * kr * 0.95f},
+            {900, 500}, {900 + LEG_A * ks, 500}, {900, 500 + LEG_B * ks}};
+        int ir_, ia, ib; float err = 0, k = 0;
+        lps::findIrRightTriangle(pts, LEG_A, LEG_B, TOL, ir_, ia, ib, err, k);
+        const bool old_wrong = ir_ >= 3;
+        std::printf("  %s  %-34s Zopt=%.1f m (sahte secildi, sonra Z kontrolu reddederdi)\n",
+                    old_wrong ? "OK  " : "HATA", "olcek siniri YOK", 647.5f / k);
+        if (!old_wrong) ++failures;
+        const float tol = 0.5f, Z = 4.0f;
+        const bool f = lps::findIrRightTriangle(pts, LEG_A, LEG_B, TOL, ir_, ia, ib, err, k,
+                                                647.5f / (Z * (1 + tol)), 647.5f / (Z * (1 - tol)));
+        const bool ok = f && ir_ < 3 && ia < 3 && ib < 3;
+        std::printf("  %s  %-34s Zopt=%.2f m fit=%.3f\n", ok ? "OK  " : "HATA",
+                    "irtifa 4 m +-%50 ile", 647.5f / k, err);
+        if (!ok) ++failures;
+    }
+
+    std::printf("\n[10] Huni merkezi: olculen yerlesim (R-sol 1.31, R-sag 1.445; merkez 0.655/0.617)\n");
+    {
+        // marker duzleminde: R=(0,0), sol=(1.31,0), sag=(0,1.445); merkez=(0.655,0.617)
+        // goruntu: 150 px/m, 30 derece donuk, (400,200) kaydirilmis -> afin
+        const float s = 150.f, c = std::cos(0.5236f), sn = std::sin(0.5236f);
+        auto px = [&](float x, float y) { return cv::Point2f(400 + s * (c * x - sn * y), 200 + s * (sn * x + c * y)); };
+        const cv::Point2f R = px(0, 0), S = px(1.31f, 0), L = px(0, 1.445f), C = px(0.655f, 0.617f);
+        for (int sw = 0; sw < 2; ++sw) {   // a/b sirasi fark etmemeli
+            bool used = false;
+            const cv::Point2f got = sw ? lps::irMarkerCenter(R, L, S, 1.31f, 1.445f, 0.655f, 0.617f, 1.03f, used)
+                                       : lps::irMarkerCenter(R, S, L, 1.31f, 1.445f, 0.655f, 0.617f, 1.03f, used);
+            const double e = cv::norm(got - C) / s * 100;
+            const bool ok = used && e < 0.1;
+            std::printf("  %s  %-34s hata %.2f cm\n", ok ? "OK  " : "HATA", sw ? "sira ters (sag, sol)" : "sira (sol, sag)", e);
+            if (!ok) ++failures;
+        }
+        const double mid_err = cv::norm((S + L) * 0.5f - C) / s * 100;
+        std::printf("        (eski hipotenus ortasi %.1f cm uzakta)\n", mid_err);
+        // kenarlar esit gorunurse (orani < 1.03) -> hipotenus ortasi
+        bool used = true;
+        const cv::Point2f Lk = R + (L - R) * (1.31f / 1.445f * 1.01f);
+        const cv::Point2f got = lps::irMarkerCenter(R, S, Lk, 1.31f, 1.445f, 0.655f, 0.617f, 1.03f, used);
+        const bool ok = !used && cv::norm(got - (S + Lk) * 0.5f) < 1e-3;
+        std::printf("  %s  %-34s orta noktaya dustu\n", ok ? "OK  " : "HATA", "kenarlar ayirt edilemez (1.01)");
+        if (!ok) ++failures;
+    }
+
     std::printf("\n=== %s ===\n\n",
                 failures == 0 ? "TUM TESTLER GECTI"
                               : (std::to_string(failures) + " TEST BASARISIZ").c_str());
