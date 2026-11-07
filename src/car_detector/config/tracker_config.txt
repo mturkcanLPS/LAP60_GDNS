@@ -1,0 +1,14 @@
+# car_detector nvtracker ayarlari — deepstream-test2 [tracker] keyfile formati.
+# Bunu ELLE duzenleyip node'u yeniden calistir (RECOMPILE GEREKMEZ).
+#
+# ll-config-file -> NvDCF davranis dosyasi:
+#   config_tracker_NvDCF_perf.yml      (VARSAYILAN, model gerektirmez)
+#   config_tracker_NvDCF_max_perf.yml  (daha hafif)
+#   config_tracker_NvDCF_accuracy.yml  (derin ReID -> resnet50_market1501.etlt INMELI)
+#   config_tracker_IOU.yml / NvSORT.yml (sade, gorsel model yok)
+[tracker]
+tracker-width=640
+tracker-height=384
+gpu-id=0
+ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+ll-config-file=tracker_NvDCF_tuned.yml

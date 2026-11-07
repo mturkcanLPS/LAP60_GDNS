@@ -11,6 +11,7 @@
   <depend>rclcpp</depend>
   <depend>isaac_ros_apriltag_interfaces</depend>
   <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
   <depend>cv_bridge</depend>
 
   <export>

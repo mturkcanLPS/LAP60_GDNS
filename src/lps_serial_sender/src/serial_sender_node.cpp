@@ -25,6 +25,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <isaac_ros_apriltag_interfaces/msg/april_tag_detection_array.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>   // car_detector bearing (TEST)
 #include <cv_bridge/cv_bridge.h>
 
 #include <opencv2/opencv.hpp>
@@ -53,6 +54,14 @@
 /* offset        : tag merkezi → landing point (camera frame, XY)      */
 /* physical_size : gercek tag boyutu (PnP size scaling icin)           */
 /* ------------------------------------------------------------------ */
+// === Inis modu secimi (DERLEME ZAMANI) ===
+//   0 = HUNI modu  : avgPos = 4 huni tag'inin outlier'siz ORTALAMASI,
+//                    tag1..tag4 = her tag TEK TEK  (uçuş modu — VARSAYILAN)
+//   1 = 45/24 modu : iki-tag test inişi (avgPos = 45 offset'li / 24 olcekli)
+// Modu degistirmek icin SADECE bu satirdaki 0/1'i degistir + colcon build.
+// (Not: 'true/false' degil integer — preprocessor'da net olsun diye.)
+#define TEST_APRITLAG 0
+
 struct TagMeta {
     cv::Vec3f offset;
     float     physical_size_m;
@@ -74,6 +83,22 @@ static void quatToRPY(double qx, double qy, double qz, double qw,
     double siny = 2.0 * (qw * qz + qx * qy);
     double cosy = 1.0 - 2.0 * (qy * qy + qz * qz);
     yaw = (float)std::atan2(siny, cosy);
+}
+
+/* Quaternion → 3x3 rotasyon matrisi (R_(kamera←tag)).
+   Bu R, tag-frame'deki bir vektoru kamera frame'ine tasir:
+   offset_kamera = R * offset_tagframe. Icinde montaj egimi + drone
+   attitude birlikte gelir (canli olculur). */
+static cv::Matx33f quatToMatrix(double qx, double qy, double qz, double qw)
+{
+    // Normalize (guvenlik icin)
+    double n = std::sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
+    if (n < 1e-9) return cv::Matx33f::eye();
+    qx/=n; qy/=n; qz/=n; qw/=n;
+    return cv::Matx33f(
+        (float)(1-2*(qy*qy+qz*qz)), (float)(2*(qx*qy-qz*qw)),   (float)(2*(qx*qz+qy*qw)),
+        (float)(2*(qx*qy+qz*qw)),   (float)(1-2*(qx*qx+qz*qz)), (float)(2*(qy*qz-qx*qw)),
+        (float)(2*(qx*qz-qy*qw)),   (float)(2*(qy*qz+qx*qw)),   (float)(1-2*(qx*qx+qy*qy)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -100,12 +125,17 @@ public:
         // false = periyodik log YOK (sadece acilis + hata loglari kalir)
         debug_        = declare_parameter<bool>("debug", false);
 
-        // AprilTag node'unda set'lenmis size parametresi — per-ID size scaling icin referans
-        apriltag_node_size_ = (float)declare_parameter<double>("apriltag_node_size", 0.984);
+        // AprilTag node'unda set'lenmis size parametresi — per-ID size scaling icin referans.
+        // FUNNEL (tag25h9) modu: node size=0.25 (duvar buyuk tag siyah kare=250mm).
+        // Kucuk tag'ler (0.077) tag_meta'da per-ID scale ile duzeltilir.
+        apriltag_node_size_ = (float)declare_parameter<double>("apriltag_node_size", 0.25);
 
         // Tag verisi bu kadar sure yenilenmezse valid=false gonderilir
         // (pipeline stall'inda bayat pozisyonu 50Hz'de tekrarlamamak icin)
         tag_timeout_ms_ = declare_parameter<int>("tag_timeout_ms", 500);
+
+        // TEST: car_detector bearing'ini avgPos'a enjekte et (default KAPALI).
+        car_avg_inject_ = declare_parameter<bool>("car_avg_inject", false);
 
         // TX thread CPU sabitleme (-1 = kapali). Jetson'da tum IRQ'lar
         // CPU0'da toplaniyor; TX thread USB/GPU interrupt firtinasinin
@@ -168,12 +198,44 @@ public:
             }
         }
 
+        // Huni kalibrasyon logu: her tespit edilen tag icin HAM poz
+        // (Tpos + quaternion) + turevleri. Bu logdan tag-frame 'o' offset'i
+        // kalibre edilir ve R*offset dogrulanir. Analiz icin; opsiyonel.
+        if (declare_parameter<bool>("funnel_csv", false)) {
+            char stamp[32];
+            const std::time_t now = std::time(nullptr);
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S",
+                          std::localtime(&now));
+            const std::string path = rec_dir + "/funnel_" + stamp + ".csv";
+            funnel_csv_.open(path);
+            if (funnel_csv_) {
+                funnel_csv_ << "t_ms,tag_id,tx,ty,tz,qx,qy,qz,qw,"
+                               "roll_deg,pitch_deg,yaw_deg,"
+                               "ox_cam,oy_cam,oz_cam,est_x,est_y,est_z\n";
+                funnel_csv_.flush();
+                RCLCPP_INFO(get_logger(), "Huni kalibrasyon CSV: %s", path.c_str());
+            } else {
+                RCLCPP_ERROR(get_logger(), "Huni CSV acilamadi: %s", path.c_str());
+            }
+        }
+
         serial_fd_ = lps::openSerial(serial_port_, baud_rate_);
 
         tag_sub_ = create_subscription<
             isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>(
             tag_topic_, rclcpp::SensorDataQoS(),
             std::bind(&SerialSenderNode::tagCb, this, std::placeholders::_1));
+
+        // TEST: car_detector bearing'ini apriltag avgPos'a enjekte et.
+        // Default KAPALI -> funnel'a sifir etki. Acikken txThread avgPos'u
+        // car bearing'iyle EZER (funnel yazimi degismez, sadece gonderim aninda).
+        if (car_avg_inject_) {
+            car_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
+                "/car_detection/bearing", rclcpp::SensorDataQoS(),
+                std::bind(&SerialSenderNode::carCb, this, std::placeholders::_1));
+            RCLCPP_WARN(get_logger(),
+                "[CAR-TEST] car_avg_inject ACIK -> avgPos = car bearing (funnel EZILIR)");
+        }
 
         img_sub_ = create_subscription<sensor_msgs::msg::Image>(
             image_topic_, rclcpp::SensorDataQoS(),
@@ -215,6 +277,7 @@ public:
 
         // CSV: VPI thread durduktan SONRA kapat (yazan o thread'di)
         if (flow_csv_.is_open()) flow_csv_.close();
+        if (funnel_csv_.is_open()) funnel_csv_.close();
 
         if (serial_fd_ >= 0) ::close(serial_fd_);
     }
@@ -234,14 +297,39 @@ private:
         ap.timeStamp = msSinceStart(
             (uint64_t)rclcpp::Time(msg->header.stamp).nanoseconds());
 
+#if TEST_APRITLAG   // ===== 45/24 IKI-TAG TEST INISI =====
+        // avgPos = 45 (buyuk, offset'li) ya da 24 (kucuk, olcekli).
+        // tag1..tag4 KULLANILMAZ (bu modda huni yok). Huni modu icin #else'e bak.
         for (const auto &det : msg->detections) {
-            if (det.id != 45) continue;
+            // Sadece hedef tag'ler: 45 = buyuk (245mm), 24 = kucuk (95mm).
+            // Hedef DEGILSE atla — yoksa alakasiz bir tag valid=true + (0,0,0)
+            // gonderip break edip gercek tag'e hic ulasamiyordu.
+            if (det.id != 45 && det.id != 24) continue;
 
             const auto &p = det.pose.pose.pose;
             ap.avgPos.valid = true;
-            ap.avgPos.pos.x = (float)p.position.x;
-            ap.avgPos.pos.y = (float)p.position.y;
-            ap.avgPos.pos.z = (float)p.position.z;
+            if(det.id == 45){
+                // Buyuk tag: pozisyonu kucuk tag merkezine kaydir. Offset TAG
+                // FRAME'inde (0,-0.215,0 = kucuk tag 21.5cm) ve R ile kamera
+                // frame'ine cevrilir -> HER drone acisinda dogru (funnel mantigi;
+                // eski sabit kamera-Y offset sadece dik bakista dogruydu).
+                // NOT: offset tag'in dik/hizali yapistirildigini varsayar; egik
+                // yapistirilmissa yon degisir (bir 45/24 logu ile dogrulanabilir).
+                const auto &q = p.orientation;
+                cv::Matx33f R = quatToMatrix(q.x, q.y, q.z, q.w);
+                cv::Vec3f off = R * cv::Vec3f(0.0f, -0.215f, 0.0f);
+                ap.avgPos.pos.x = (float)p.position.x + off[0];
+                ap.avgPos.pos.y = (float)p.position.y + off[1];
+                ap.avgPos.pos.z = (float)p.position.z + off[2];
+            }else{ // det.id == 24
+                // Kucuk tag: AprilTag node size=0.245'e gore PnP olceklendi,
+                // gercek boyut 0.095 -> pozisyon vektorunu duzelt.
+                float scale = 0.095f / apriltag_node_size_;
+                ap.avgPos.pos.x = (float)p.position.x * scale;
+                ap.avgPos.pos.y = (float)p.position.y * scale;
+                ap.avgPos.pos.z = (float)p.position.z * scale;
+            }
+
             float roll, pitch, yaw;
             quatToRPY(p.orientation.x, p.orientation.y,
                       p.orientation.z, p.orientation.w,
@@ -253,8 +341,9 @@ private:
             ap.avgPos.angle.yaw   = yaw   * R2D;
             break;
         }
+#else               // ===== HUNI MODU (4 tag: ortalama + tek tek) =====
 
-        // === Offset-based funnel landing estimation (debug only) ===
+        // === Offset-based funnel landing estimation → PAKETE gider ===
         std::vector<cv::Vec3f> estimates;
         std::vector<cv::Vec3f> raws;
         std::vector<int>       used_ids;
@@ -270,17 +359,39 @@ private:
             float scale = meta.physical_size_m / apriltag_node_size_;
 
             const auto &p = det.pose.pose.pose.position;
+            const auto &q = det.pose.pose.pose.orientation;
             cv::Vec3f tag_pos(
                 (float)p.x * scale,
                 (float)p.y * scale,
                 (float)p.z * scale);
 
-            // Offset direkt camera frame'inde — yaw rotasyonu yok
-            // (drone level + heading sabit varsayimi; kamera egikse tahmini
-            //  otopilot IMU/ivme ile duzeltir)
+            // Offset'i tag'in OLCULEN oryantasyonuyla dondur:
+            //   offset_kamera = R * offset_tagframe
+            // R = quat→matris (montaj egimi + drone attitude birlikte, canli).
+            // NOT: meta.offset su an eski (duz-zemin) degerleriyle — PLACEHOLDER.
+            // Gercek tag-frame 'o' vektoru bu ucusun logundan kalibre edilecek.
+            cv::Matx33f R = quatToMatrix(q.x, q.y, q.z, q.w);
+            cv::Vec3f   offset_cam = R * meta.offset;
+            cv::Vec3f   est = tag_pos + offset_cam;
+
             raws.push_back(tag_pos);
-            estimates.push_back(tag_pos + meta.offset);
+            estimates.push_back(est);
             used_ids.push_back(det.id);
+
+            // === Kalibrasyon logu: HAM poz (Tpos + quaternion) + turevleri ===
+            if (funnel_csv_.is_open()) {
+                float roll, pitch, yaw;
+                quatToRPY(q.x, q.y, q.z, q.w, roll, pitch, yaw);
+                const float R2D = 180.0f / (float)M_PI;
+                funnel_csv_
+                    << ap.timeStamp << ',' << det.id << ','
+                    << tag_pos[0] << ',' << tag_pos[1] << ',' << tag_pos[2] << ','
+                    << q.x << ',' << q.y << ',' << q.z << ',' << q.w << ','
+                    << roll*R2D << ',' << pitch*R2D << ',' << yaw*R2D << ','
+                    << offset_cam[0] << ',' << offset_cam[1] << ',' << offset_cam[2] << ','
+                    << est[0] << ',' << est[1] << ',' << est[2] << '\n';
+                if (++funnel_csv_lines_ % 30 == 0) funnel_csv_.flush();
+            }
         }
 
         // Median tabanli outlier rejection + ortalama
@@ -314,13 +425,27 @@ private:
             if (n_inliers > 0) funnel = sum * (1.0f / n_inliers);
         }
 
-        // Video overlay icin TUM tespitlerin koseleri (recorder aciksa)
+        // === Funnel sonuclarini PAKETE yaz (otopilota gider) ===
+        // avgPos = outlier'siz ortalama (huni merkezi fuzyonu). POZISYON sadece
+        // avgPos'ta gider; tek tek tag pozlari artik GONDERILMIYOR — her tag'in
+        // yalnizca VALIDITY bit'i basiliyor (validity bitfield'ina).
+        ap.avgPos.valid = (n_inliers > 0);
+        ap.avgPos.pos.x = funnel[0];
+        ap.avgPos.pos.y = funnel[1];
+        ap.avgPos.pos.z = funnel[2];
+        // angle: huni ortalamasinin tek dogal yonu yok — 0 birakiliyor.
+        // ESKI PAKET: per-tag validity biti YOK; sadece avgPos.valid + pos gider.
+        // (tag1-4 alanlari pakette var ama hep 0 — firmware ile uyumlu.)
+#endif
+
+        
         std::vector<lps::DebugRecorder::TagOverlay> overlays;
         if (recorder_) {
             overlays.reserve(msg->detections.size());
             for (const auto &det : msg->detections) {
                 lps::DebugRecorder::TagOverlay t;
                 t.id = det.id;
+                if (tag_meta_.find(det.id) == tag_meta_.end()) continue;  // huni tag'leri (duvar+kucuk)
                 for (int i = 0; i < 4; ++i)
                     t.corners[i] = cv::Point2f((float)det.corners[i].x,
                                                (float)det.corners[i].y);
@@ -332,11 +457,28 @@ private:
             std::lock_guard<std::mutex> lk(data_mutex_);
             apriltag_               = ap;
             last_tag_msg_tp_        = std::chrono::steady_clock::now();
+#if !TEST_APRITLAG   // huni debug degiskenleri SADECE huni modunda uretiliyor
             funnel_landing_         = funnel;
             funnel_landing_n_seen_  = (uint8_t)estimates.size();
             funnel_landing_n_used_  = (uint8_t)n_inliers;
             funnel_per_tag_         = std::move(per_tag);
+#endif
             tag_overlays_           = std::move(overlays);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* TEST: car_detector bearing -> car_avg state (txThread avgPos'u  */
+    /* bununla ezer, SADECE car_avg_inject acikken).                   */
+    void carCb(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        car_valid_ = (msg->vector.z >= 0.0);    // z<0 => kilit yok
+        if (car_valid_) {
+            car_pos_.x = (float)msg->vector.x;   // bearing X/Z
+            car_pos_.y = (float)msg->vector.y;   // bearing Y/Z
+            car_pos_.z = 0.0f;
+            car_tp_    = std::chrono::steady_clock::now();
         }
     }
 
@@ -479,16 +621,11 @@ private:
         }
     }
 
-    /* -------------------------------------------------------------- */
     /* TX thread — sabit frekansta seri porta paket gonderir           */
-    /* Mutlak deadline pacing: executor'daki callback yogunlugundan    */
-    /* etkilenmez. Gec kalinirsa telafi paketi hemen gider, hicbir     */
-    /* slot atlanmaz (paket kaybi yerine bir kerelik sik aralik).      */
-    /* -------------------------------------------------------------- */
+
     void txThread()
     {
-        // RT oncelik dene — wakeup latency'yi dusurur. Izin yoksa (root /
-        // CAP_SYS_NICE gerekir) sessizce normal scheduler'da devam eder.
+
         {
             sched_param sp{};
             sp.sched_priority = 50;
@@ -498,7 +635,7 @@ private:
             }
         }
 
-        // IRQ firtinasindan uzak sakin bir core'a sabitle (tx_cpu param)
+        
         if (tx_cpu_ >= 0) {
             cpu_set_t cpus;
             CPU_ZERO(&cpus);
@@ -522,10 +659,6 @@ private:
             next += period;
             auto now = std::chrono::steady_clock::now();
             if (next < now) {
-                // Gec kalindi — slotu ATLAMA (eski ROS timer semantigi):
-                // telafi paketi hemen gitsin, takvim ondan sonra otursun.
-                // Boylece stall paket KAYBINA degil, bir kerelik sik
-                // aralikli iki pakete donusur.
                 next = now;
             }
         }
@@ -538,11 +671,17 @@ private:
         apriltagPack_t  at_copy;
         opticFlowPack_t of_copy;
         std::chrono::steady_clock::time_point last_tag_tp;
+        bool        car_valid_copy = false;
+        float_3D_t  car_pos_copy{};
+        std::chrono::steady_clock::time_point car_tp_copy;
         {
             std::lock_guard<std::mutex> lk(data_mutex_);
             at_copy     = apriltag_;
             of_copy     = opticflow_;
             last_tag_tp = last_tag_msg_tp_;
+            car_valid_copy = car_valid_;
+            car_pos_copy   = car_pos_;
+            car_tp_copy    = car_tp_;
         }
 
         // Staleness: tag pipeline'i durduysa bayat "valid" pozu gondermeye devam etme
@@ -550,6 +689,28 @@ private:
             std::chrono::steady_clock::now() - last_tag_tp).count();
         if (tag_age_ms > tag_timeout_ms_) {
             at_copy.avgPos.valid = false;
+        }
+
+        // TEST: car bearing enjeksiyonu — avgPos'u car ile EZ (funnel override).
+        // SADECE car_avg_inject acikken. Kendi staleness'i var (tag_timeout_ms).
+        if (car_avg_inject_) {
+            auto car_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - car_tp_copy).count();
+            if (car_valid_copy && car_age_ms <= tag_timeout_ms_) {
+                at_copy.avgPos.pos = car_pos_copy;   // bearing X/Z, Y/Z, 0
+                at_copy.avgPos.valid = true;
+            } else {
+                at_copy.avgPos.valid = false;        // car kayip -> gecersiz
+            }
+        }
+
+        // DEBUG: gonderilen avgPos'u 1 sn'de bir bas (debug=true iken).
+        if (debug_) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                "[TX] avgPos valid=%d pos=(%.3f, %.3f, %.3f)%s",
+                (int)at_copy.avgPos.valid,
+                at_copy.avgPos.pos.x, at_copy.avgPos.pos.y, at_copy.avgPos.pos.z,
+                car_avg_inject_ ? "  [CAR-INJECT]" : "");
         }
 
         jetsonOtopilotPack_ut pkt;
@@ -627,7 +788,7 @@ private:
 
         // RCLCPP_INFO(get_logger(),
         //     "[APRILTAG] valid=%s%s pos=(%.3f, %.3f, %.3f) rpy_deg=(%.1f, %.1f, %.1f)",
-        //     (at_copy.avgPos.valid && !stale) ? "Y" : "N",
+        //     (at_copy.avgPos.validity.valid && !stale) ? "Y" : "N",
         //     stale ? " (STALE)" : "",
         //     at_copy.avgPos.pos.x, at_copy.avgPos.pos.y, at_copy.avgPos.pos.z,
         //     at_copy.avgPos.angle.roll,
@@ -691,26 +852,43 @@ private:
 
     /* params */
     std::string serial_port_, tag_topic_, image_topic_;
-    int    baud_rate_ = 921600;
-    double send_rate_hz_ = 20.0;
+    int    baud_rate_ = 115200;
+    double send_rate_hz_ = 50.0;
     bool   debug_ = true;
-    float  apriltag_node_size_ = 0.984f;
+    float  apriltag_node_size_ = 0.25f;   // tag25h9 huni duvar buyuk tag = 250mm
     int    tag_timeout_ms_ = 500;
     int    tx_cpu_ = 5;   // TX thread'in sabitlendigi core (-1 = kapali)
 
     /* Tag offset-based landing estimation (debug only, serial'a gitmiyor)
        Offset'ler camera frame'inde, R = 0.30m varsayimi (mekanik olcumle revize edilecek) */
-    const std::map<int, TagMeta> tag_meta_ = {
-        // N tag — kamera frame'de -Y'de gorunur, offset +Y ile ortalar
-        { 0, {cv::Vec3f( 0.000f, +0.300f, 0.0f), 0.280f}},
-        // S tag — kamera frame'de +Y'de gorunur, offset -Y
-        {20, {cv::Vec3f( 0.000f, -0.300f, 0.0f), 0.280f}},
-        // E tag — kamera frame'de +X'te gorunur, offset -X
-        {24, {cv::Vec3f(-0.300f,  0.000f, 0.0f), 0.280f}},
-        // W tag — kamera frame'de -X'te gorunur, offset +X
-        {36, {cv::Vec3f(+0.300f,  0.000f, 0.0f), 0.280f}},
-        // Buyuk debug/uzak tag — huni merkezinde varsayilan (offset=0)
-        {45, {cv::Vec3f( 0.000f,  0.000f, 0.0f), 0.984f}},
+    // Offset'ler TAG-FRAME'de (o vektoru): huni merkezi = tag_pos + R*offset,
+    // R = tag'in olculen oryantasyonu (montaj egimi + drone attitude birlikte).
+    // 26_08_11 KALIBRASYONU — 3 huni log'u birlikte cozuldu (co-visibility
+    // kisiti: tum tag'ler ayni merkezi gostersin). Sonuc: 4 tag merkezi
+    // 3-5 mm icinde ayni noktada bulusuyor (per-tag consensus sapmasi).
+    // Eski duz-zemin (+-0.30, Z=0) degerleri 40-51° montaj egimini yok
+    // sayiyordu; buradaki Z bileseni (~-0.06..-0.18) o egimi tasiyor.
+    // Tag 24 (E) en zayif belirlenen (~1-2 cm); ucusta ortalama+outlier yumusatir.
+    // ID'ler tag36h11 (dik yapistirma): 0(N)/20(E)/24(S)/36(W). W tekrar 36
+    // (36h11'de var). Offset'ler yeni yapistirma sonrasi funnel log'undan
+    // centroid-anchor ile kalibre edilecek.
+    const std::map<int, TagMeta>  tag_meta_ = {
+        // ===== tag25h9 HUNI — KALIBRE (26_08_20, funnel_20260820_163329) =====
+        // Hedef = DIP (kucuk tag centroid = asil inis noktasi). Her tag:
+        //   o_i = mean_kare R_i^-1(kucuk_centroid - T_i). 8 tag da AYNI dip noktayi
+        //   hedefler -> avgPos her yerde tutarli. Dogrulama: uyum medyan 3.6mm,
+        //   duvar-kucuk merkez 3B farki 3.7mm (Z farki 172mm->3.7mm), k-fold std
+        //   0.1-0.4mm. Gauge-free (dip centroid anchor). Duvar size 0.25, kucuk 0.077.
+        { 0, {cv::Vec3f(+0.0023f, +0.2998f, -0.0712f), 0.25f}},  // N
+        {20, {cv::Vec3f(-0.0019f, +0.2986f, -0.0789f), 0.25f}},  // E
+        {24, {cv::Vec3f(+0.0027f, +0.3008f, -0.0735f), 0.25f}},  // S
+        {34, {cv::Vec3f(+0.0014f, +0.2993f, -0.0757f), 0.25f}},  // W
+        // Alt-orta KUCUK tag'ler (tag25h9, 77mm) ID 10/12/14/16 (2x2: 10=sol-ust
+        //   12=sag-ust 14=sol-alt 16=sag-alt). avgPos'a katilir (paket slotu YOK).
+        {10, {cv::Vec3f(+0.0429f, +0.0430f, -0.0010f), 0.077f}},  // sol-ust
+        {12, {cv::Vec3f(-0.0435f, +0.0432f, +0.0045f), 0.077f}},  // sag-ust
+        {14, {cv::Vec3f(+0.0432f, -0.0427f, -0.0095f), 0.077f}},  // sol-alt
+        {16, {cv::Vec3f(-0.0434f, -0.0428f, +0.0010f), 0.077f}},  // sag-alt
     };
 
     struct PerTagLanding {
@@ -734,6 +912,7 @@ private:
     rclcpp::Subscription<
         isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>::SharedPtr tag_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr car_sub_;  // TEST
     rclcpp::TimerBase::SharedPtr debug_timer_;
 
     /* TX thread — sabit periyotlu paket gonderimi */
@@ -745,6 +924,12 @@ private:
     apriltagPack_t  apriltag_{};
     opticFlowPack_t opticflow_{};
     std::chrono::steady_clock::time_point last_tag_msg_tp_{};   // epoch = "hic gelmedi"
+
+    /* TEST: car_detector bearing enjeksiyonu (car_avg_inject) */
+    bool        car_avg_inject_ = false;
+    bool        car_valid_ = false;
+    float_3D_t  car_pos_{};
+    std::chrono::steady_clock::time_point car_tp_{};
     cv::Vec3f funnel_landing_{0, 0, 0};
     uint8_t   funnel_landing_n_seen_ = 0;
     uint8_t   funnel_landing_n_used_ = 0;
@@ -771,6 +956,8 @@ private:
     std::unique_ptr<lps::DebugRecorder> recorder_;
     std::ofstream flow_csv_;    // ham akis logu (VPI thread'inden yazilir)
     uint64_t      csv_lines_ = 0;
+    std::ofstream funnel_csv_;  // huni kalibrasyon logu (tagCb'den yazilir)
+    uint64_t      funnel_csv_lines_ = 0;
     std::vector<lps::DebugRecorder::TagOverlay> tag_overlays_;  // data_mutex_
 
     std::chrono::steady_clock::time_point start_time_;

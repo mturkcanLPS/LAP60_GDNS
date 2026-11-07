@@ -1,11 +1,15 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, TimerAction, ExecuteProcess
+from launch.actions import (IncludeLaunchDescription, TimerAction, ExecuteProcess,
+                            DeclareLaunchArgument)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from launch.substitutions import PathJoinSubstitution
+from launch.substitutions import (PathJoinSubstitution, LaunchConfiguration,
+                                  PythonExpression)
+from launch.conditions import IfCondition
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -19,7 +23,7 @@ def generate_launch_description():
             ])
         ),
         launch_arguments={
-            'enable_color': 'false',
+            'enable_color': 'true',
             'enable_depth': 'false',
             'enable_infra1': 'true',
             'enable_infra2': 'false',
@@ -27,6 +31,7 @@ def generate_launch_description():
             'enable_accel': 'false',
             'depth_module.infra_profile': '1280x720x30',
             'depth_module.depth_profile': '1280x720x30',
+            'rgb_camera.color_profile': '1280x720x15', 
         }.items()
     )
 
@@ -96,13 +101,16 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 2) AprilTag container: mono→rgb dönüştürücü + AprilTag
+    # 2) AprilTag container (GPU/Isaac): mono→rgb + AprilTag.
+    #    SADECE apriltag_backend:=gpu iken calisir (varsayilan cpu).
     apriltag_container = ComposableNodeContainer(
         name='apriltag_container',
         namespace='',
         package='rclcpp_components',
         executable='component_container_mt',
         output='screen',
+        condition=IfCondition(PythonExpression(
+            ["'", LaunchConfiguration('apriltag_backend'), "' == 'gpu'"])),
         composable_node_descriptions=[
             # mono8 → rgb8 dönüştürücü
             ComposableNode(
@@ -127,8 +135,10 @@ def generate_launch_description():
                     ('camera_info', '/camera/camera/infra1/camera_info'),
                 ],
                 parameters=[{
-                    'size': 0.984,
-                    'tag_family': 'tag36h11',
+                    # tag25h9 huni duvar buyuk tag siyah kare = 250mm. GPU yolu
+                    # aktif degil (varsayilan CPU) ama tutarli olsun diye guncel.
+                    'size': 0.25,
+                    'tag_family': 'tag25h9',
                     'max_tags': 64,
                     'tile_size': 4,
                 }],
@@ -167,16 +177,89 @@ def generate_launch_description():
             'record_video': True,
             # Ham optik akis CSV'si (EMA ONCESI kare-basi olcum) — analiz icin.
             # record_dir'e flow_YYYYmmdd_HHMMSS.csv olarak duser.
-            'flow_csv':     True,
+            'flow_csv':     False,   # artik bakilmiyor -> kapali (CPU/disk yormasin)
+            # Huni kalibrasyon CSV'si — her tespit edilen tag icin HAM poz
+            # (Tpos + quaternion). record_dir'e funnel_YYYYmmdd_HHMMSS.csv.
+            'funnel_csv':   True,
             'record_dir':   '/home/lapis/lps_records',
             'record_fps':   15.0,
             'record_scale': 0.5,
+            # TEST: car_detector bearing'ini avgPos'a enjekte et (default False).
+            # `car_avg_inject:=true` ile ac -> avgPos = car bearing (funnel EZILIR).
+            'car_avg_inject': ParameterValue(
+                LaunchConfiguration('car_avg_inject'), value_type=bool),
+        }],
+    )
+
+    # === AprilTag arka ucu secimi ===
+    #   apriltag_backend:=cpu  (VARSAYILAN) -> CPU (libapriltag), /tag_detections
+    #   apriltag_backend:=gpu               -> Isaac GPU container, /tag_detections
+    # Ikisi de tag25h9 kullanir ve AYNI topic'e (/tag_detections) yayinlar;
+    # serial_sender degismeden hangisi acilirsa onu tuketir.
+    # CPU'nun Isaac'a ustunlugu 26_08_13 A/B'de olculdu: uzak/egik sahnede
+    # Isaac tag 20/24'u tamamen kacirdi (0), CPU 874/551 yakaladi (quad_decimate=1
+    # tam cozunurluk + decode_sharpening sayesinde). Bu yuzden varsayilan CPU.
+    backend_arg = DeclareLaunchArgument('apriltag_backend', default_value='cpu')
+    # tag_family: `tag_family:=tagCircle21h7` ile aile degistirip dene.
+    # Desteklenen: tag36h11/tag36h10/tag25h9/tag16h5/tagCircle21h7/tagCircle49h12/
+    #              tagCustom48h12/tagStandard41h12/tagStandard52h13
+    # Huni tag25h9 (gecis) -> default bu. Baska aile icin `tag_family:=...` ile ez.
+    tag_family_arg = DeclareLaunchArgument('tag_family', default_value='tag25h9')
+    # TEST: car_detector bearing'ini serial_sender avgPos'a enjekte et (default false).
+    car_inject_arg = DeclareLaunchArgument('car_avg_inject', default_value='true')
+    # car_detector'i bringup'la beraber ac (default ACIK — bir daha unutma!).
+    # Kapatmak icin: enable_car:=false
+    enable_car_arg = DeclareLaunchArgument('enable_car', default_value='true')
+    cpu_apriltag = Node(
+        package='lps_serial_sender', executable='cpu_apriltag_node',
+        name='cpu_apriltag', output='screen',
+        condition=IfCondition(PythonExpression(
+            ["'", LaunchConfiguration('apriltag_backend'), "' == 'cpu'"])),
+        parameters=[{
+            'image_topic':       '/camera/camera/infra1/image_rect_raw',
+            'camera_info_topic': '/camera/camera/infra1/camera_info',
+            'output_topic':      '/tag_detections',   # asil topic (serial_sender abone)
+            'tag_family':        LaunchConfiguration('tag_family'),  # arg ile degistir
+            'size':              0.25,    # tag25h9 huni duvar buyuk tag siyah kare = 250mm
+            'quad_decimate':     1.0,          # tam cozunurluk (kucuk/uzak tag)
+            'quad_sigma':        0.0,
+            'decode_sharpening': 1.0,         # bulanik/egik tag icin artir
+            'refine_edges':      True,
+            'nthreads':          4,   # 6 cekirdekten 4'u: yogun/ucus karelerinde drop'u azaltir
+                                       # (33ms taban seri islemden; thread onu dusurmez). TX core5'te.
+        }],
+    )
+
+    # 4) EO araç tespiti (DeepStream YOLO + NvDCF) — color stream'den, kilit + bearing
+    #    -> /car_detection/bearing. EO video kaydini da alir (overlay'li .mkv).
+    #    enable_car:=false ile kapat.
+    car_detector = Node(
+        package='car_detector', executable='car_detector_node',
+        name='car_detector', output='screen',
+        condition=IfCondition(LaunchConfiguration('enable_car')),
+        parameters=[{
+            'nvinfer_config':  '/home/lapis/DeepStream-Yolo/config_infer_primary_yoloV8.txt',
+            'vehicle_classes': [3, 5],       # VisDrone: car + truck (Hilux)
+            'mux_width':       1280,
+            'mux_height':      720,
+            'record_video':    True,         # EO .mkv kaydi (overlay gomulu)
+            'record_dir':      '/home/lapis/lps_records',
+            # RealSense D435i Color 1280x720 fabrika intrinsics (SABIT — camera_info
+            # beklemeden bearing baslar). Distortion sifir. Cozunurluk degisirse
+            # rs-enumerate-devices -c ile yeniden al.
+            'fx': 909.501, 'fy': 909.527, 'cx': 643.236, 'cy': 359.794,
         }],
     )
 
     return LaunchDescription([
+        backend_arg,
+        tag_family_arg,
+        car_inject_arg,
+        enable_car_arg,
         realsense_launch,
         TimerAction(period=3.0, actions=[camera_tune]),
-        TimerAction(period=3.5, actions=[apriltag_container]),
+        TimerAction(period=3.5, actions=[apriltag_container]),  # sadece gpu backend'de
+        TimerAction(period=4.0, actions=[cpu_apriltag]),        # sadece cpu backend'de
         TimerAction(period=5.5, actions=[serial_sender]),
+        TimerAction(period=6.5, actions=[car_detector]),        # enable_car:=false ile kapat
     ])
