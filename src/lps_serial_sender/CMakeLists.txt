@@ -116,6 +116,12 @@ add_executable(test_autopilot_rx test/test_autopilot_rx.cpp)
 target_include_directories(test_autopilot_rx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 install(TARGETS test_autopilot_rx DESTINATION lib/${PROJECT_NAME})
 
+# --- AprilTag gecerlilik kapisi testi (tag_gate.hpp; donanimsiz) ---
+# Calistirma: ros2 run lps_serial_sender test_tag_gate
+add_executable(test_tag_gate test/test_tag_gate.cpp)
+target_include_directories(test_tag_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+install(TARGETS test_tag_gate DESTINATION lib/${PROJECT_NAME})
+
 # --- infra1 + infra2 birlesimi testi (dual_camera_fusion.hpp; donanimsiz) ---
 # Calistirma: ros2 run lps_serial_sender test_dual_fusion
 add_executable(test_dual_fusion test/test_dual_fusion.cpp)

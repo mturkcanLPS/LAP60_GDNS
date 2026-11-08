@@ -41,6 +41,7 @@
 #include "lps_serial_sender/debug_recorder.hpp"   // ucus video kaydi (opsiyonel)
 #include "lps_serial_sender/ir_triangle.hpp"      // IR blob tespiti + ucgen eslesmesi
 #include "lps_serial_sender/tag_fusion.hpp"       // AprilTag -> avgPos (infra2 ile ORTAK)
+#include "lps_serial_sender/tag_gate.hpp"         // 08_11: kisa tag goruslerini otopilota gonderme
 #include "lps_serial_sender/frame_gap_stats.hpp"  // akis kare araligi duzenliligi
 #include "lps_serial_sender/system_health.hpp"    // Jetson sicaklik/yuk/guc -> health alani
 #include "lps_serial_sender/autopilot_rx.hpp"     // otopilot -> Jetson mesajlari (0x49 KAPAT)
@@ -734,6 +735,22 @@ public:
         dual_fusion_     = declare_parameter<bool>("dual_camera_fusion", true);
         tag_pair_tol_m_  = (float)declare_parameter<double>("tag_pair_tol_m", 0.30);   // tutarsizsa infra1
         tag_fresh_ms_    = (uint32_t)declare_parameter<int>("tag_fresh_ms", 200);      // 15 Hz x3
+        // Tag gecerlilik kapisi (08_11, tag_gate.hpp): kamera basina, fuzyondan ONCE.
+        // ~10 m menzil sinirinda 1-2 karelik tag gorusleri otopilotu inisi askiya almaya
+        // goturuyordu (tag -> arac olcumu 1 s kapali -> tag gelmez -> konum kaybi).
+        // tag_min_consec ardisik tespit -> gecerli; gecerliyken tag_keep_s (1.0 s) icindeki
+        // kesintiden donus aninda gecerli. s0133'te askiya alma tetigi 18 -> 6.
+        // tag_gate_enable:=false -> eski davranis.
+        {
+            const bool en   = declare_parameter<bool>("tag_gate_enable", true);
+            const int  n    = (int)declare_parameter<int>("tag_min_consec", 3);
+            const double kp = declare_parameter<double>("tag_keep_s", 1.0);
+            tag_gate_en_ = en;
+            gate1_ = lps::TagGate(n, kp);
+            gate2_ = lps::TagGate(n, kp);
+            RCLCPP_INFO(get_logger(), "Tag kapisi %s: %d ardisik tespit, kalma %.2f s",
+                        en ? "ACIK" : "KAPALI", n, kp);
+        }
         // Iki tag sonucu ancak cekim zamanlari bu kadar yakinsa (ayni kare; 30 fps'te kare
         // 33 ms) ortalanir; degilse yeni olan gider.
         tag_sync_s_      = declare_parameter<double>("tag_pair_sync_ms", 10.0) / 1000.0;
@@ -838,6 +855,19 @@ private:
     /*   POZISYON sadece avgPos'ta gider; her tag'in sadece VALIDITY biti */
     /*   basiliyor (valid1-4=duvar, valid5-8=kucuk). hrvs/flow AYNEN korunur. */
     /* -------------------------------------------------------------- */
+    /* Kapi kapaliysa (kisa gorus) sonucu "tespit yok" gibi gonder: valid ve tag bitleri 0.
+       Konum alanlari da sifirlanir ki otopilot gecersiz kareden deger okumasin. */
+    lps::TagFusion gateFusion(const lps::TagFusion &f, lps::TagGate &g, double t_s,
+                              std::atomic<uint64_t> &supp)
+    {
+        if (!tag_gate_en_) return f;
+        const bool pass = g.update(f.valid, t_s);
+        supp.store(g.suppressed());   // log TX thread'inden okur
+        if (pass) return f;
+        lps::TagFusion out;   // valid=false, pos 0, id_bits 0
+        return out;
+    }
+
     void tagCb(const isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray::SharedPtr msg)
     {
         tag_cb_count_++;
@@ -845,7 +875,8 @@ private:
         // avgPos fuzyonu tag_fusion.hpp'de (infra2 ile ORTAK). Mod (huni / 45-24)
         // orada TEST_APRITLAG ile.
         const lps::TagFusion f = lps::fuseTags(lps::toTagDets(*msg), apriltag_node_size_);
-        apriltagPack_t ap = packFromFusion(f, msSinceStart());
+        const lps::TagFusion fg = gateFusion(f, gate1_, lps::stampSeconds(msg->header.stamp), gate1_supp_);
+        apriltagPack_t ap = packFromFusion(fg, msSinceStart());
         subtractCamOffset(ap, cam_off1_);   // -> platform merkezine gore
         if (f.valid && f.pos[2] > 0.1f) {   // IR irtifa kaynagi 'tag' (yer testi)
             tag_z_m_.store(f.pos[2]);
@@ -882,7 +913,8 @@ private:
     {
         tag2_cb_count_++;
         const lps::TagFusion f = lps::fuseTags(lps::toTagDets(*msg), apriltag_node_size_);
-        apriltagPack_t ap = packFromFusion(f, msSinceStart());
+        const lps::TagFusion fg = gateFusion(f, gate2_, lps::stampSeconds(msg->header.stamp), gate2_supp_);
+        apriltagPack_t ap = packFromFusion(fg, msSinceStart());
         subtractCamOffset(ap, cam_off2_);   // -> platform merkezine gore (aprtiltag2 de)
         std::lock_guard<std::mutex> lk(data_mutex_);
         apriltag2_  = ap;
@@ -1494,7 +1526,7 @@ private:
                 //   duvar valid1-4 = 0/20/24/34, kucuk valid5-8 = 10/12/14/16.
                 RCLCPP_INFO(get_logger(),
                     "[APRILTAG]  %.1f Hz | avg: valid=%s pos(%.3f,%.3f,%.3f) rpy(%.2f,%.2f,%.2f)"
-                    " | duvar[N%d E%d S%d W%d] kucuk[%d%d%d%d]",
+                    " | duvar[N%d E%d S%d W%d] kucuk[%d%d%d%d] | kapi bastirdi i1=%llu i2=%llu",
                     tag_fps_,
                     apriltag_.avgPos.validity.valid ? "Y" : "N",
                     apriltag_.avgPos.pos.x,
@@ -1510,7 +1542,8 @@ private:
                     apriltag_.avgPos.validity.valid5,
                     apriltag_.avgPos.validity.valid6,
                     apriltag_.avgPos.validity.valid7,
-                    apriltag_.avgPos.validity.valid8);
+                    apriltag_.avgPos.validity.valid8,
+                    (unsigned long long)gate1_supp_.load(), (unsigned long long)gate2_supp_.load());
 
                 // aralik: duzenli = hic kare atlanmadan olculen akis orani,
                 // atlanan = kameranin urettigi ama akisa girmeyen kare orani.
@@ -2028,6 +2061,10 @@ private:
     bool     dual_fusion_ = true;
     float    tag_pair_tol_m_ = 0.30f, flow_agree_px_ = 1.0f, flow_agree_frac_ = 0.3f;
     uint32_t tag_fresh_ms_ = 200, flow_fresh_ms_ = 100;
+    // Tag gecerlilik kapisi (08_11, tag_gate.hpp): gate1_ tagCb, gate2_ tagCb2 (ayri callback'ler)
+    bool          tag_gate_en_ = true;
+    lps::TagGate  gate1_, gate2_;
+    std::atomic<uint64_t> gate1_supp_{0}, gate2_supp_{0};   // bastirilan tespit (toplam)
     uint32_t fus_tag_cnt_[4] = {0, 0, 0, 0}, fus_flow_cnt_[4] = {0, 0, 0, 0};   // [yok,1,2,ikisi]
     double   fus_tag_diff_sum_ = 0; uint32_t fus_tag_diff_n_ = 0;
     uint32_t fus_tag_both_ = 0, fus_tag_sync_ = 0;   // ikisi gecerli / bunlarin ayni kareden olani

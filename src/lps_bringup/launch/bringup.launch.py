@@ -469,6 +469,12 @@ def generate_launch_description():
             # Ikizkenar: iki dik kenar da 1.36 m -> hipotenus 1.92 m. Bu boyutta
             # ucgen ~2 m altinda kadraja SIGMAZ (1.92m @ Z=2m ≈ 615 px); pratik
             # calisma araligi ~2-15 m.
+            # Tag gecerlilik kapisi (08_11, tag_gate.hpp): ~10 m'de 1-2 karelik tag gorusleri
+            # otopilotu inisi askiya almaya goturuyordu. 3 ardisik tespit -> gecerli; dogrulanmis
+            # tag 1.0 s icinde tekrar gorulurse aninda gecerli. s0133: askiya alma tetigi 18 -> 6.
+            'tag_gate_enable':   True,
+            'tag_min_consec':    3,
+            'tag_keep_s':        1.0,
             'ir_enabled':        True,
             'camera_info_topic': '/camera/camera/infra1/camera_info',
             # 06_11 kullanici olcumu: R (dik aci) - sag LED 144.5 cm, R - sol LED 131 cm

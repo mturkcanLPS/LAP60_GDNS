@@ -234,6 +234,7 @@ Checksum kuralı her yönde aynı: `headerchk = -(ilk 3 bayt) & 0xFF`, `chksum =
 - Ofsetler `src/lps_serial_sender/include/lps_serial_sender/tag_fusion.hpp` → `funnelTagMeta()`; kalibrasyon geçmişi aynı dosyada. **Referans nokta = küçük tag plakasının merkezi** (avgPos bunu gösterir).
 - Mod `#define TEST_APRITLAG 0` (huni). `1` eski 45/24 düz tag testi; değiştirirsen launch'taki tag boyutu da değişmeli.
 - Sahte tespit filtresi (`cpu_apriltag_node`): `max_hamming` 1, `min_decision_margin` 30 (launch `APRILTAG_DETECT`). Log `[TAG-FILTRE]` elenenleri yazar.
+- **Geçerlilik kapısı** (`tag_gate.hpp`, serial_sender, kamera başına): tag ancak **3 ardışık** tespitte otopilota geçerli gider; doğrulanmış tag **1.0 s** içinde tekrar görülürse anında geçerli. Neden: ~10 m'de 1–2 karelik tag görüşleri otopilotu inişi askıya almaya götürüyordu (tag → araç ölçümü 1 s kapalı → tag gelmez → konum kaybı). s0133 uçuşunda bu tetik 18 → 6. Parametreler `tag_gate_enable`, `tag_min_consec`, `tag_keep_s`; log `[APRILTAG] … kapi bastirdi i1=… i2=…`.
 
 ## IR LED üçgeni
 
