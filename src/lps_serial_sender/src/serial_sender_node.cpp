@@ -627,6 +627,27 @@ public:
             }
         }
 
+        // Otopilot -> Jetson RX kaydi (12_11): 148-151 ucuslarinda EKF yuksekligi ~11 m'de
+        // 5.5 s + 8k s'lik bloklarla kesildi, journal guc kesilince kayboldugu icin sebep
+        // gorulemedi. Her 0x4A (zaman, z, gecerli) + saniyede bir ozet (mesaj sayilari, bozuk
+        // cerceve). Sadece RX thread'i yazar; ~10 satir/s, ihmal edilebilir yuk.
+        if (declare_parameter<bool>("rx_csv", true)) {
+            const std::string dir = has_parameter("record_dir")
+                ? get_parameter("record_dir").as_string()
+                : declare_parameter<std::string>("record_dir", "/home/lapis/lps_records");
+            const std::string path = lps::claimRecordPath(dir, "rx", record_session_, "csv");
+            rx_csv_.open(path);
+            if (rx_csv_) {
+                // tip E: 0x4A geldi (gecerli -1 = bozuk yuk). tip S: son ~1 s ozeti.
+                rx_csv_ << "t_ms,tip,ekf_z,gecerli,n_4a,n_4a_gecerli,n_42,n_49,n_diger,"
+                           "bozuk_header,bozuk_yuk,atlanan_bayt,rx_bayt\n";
+                rx_csv_.flush();
+                RCLCPP_INFO(get_logger(), "RX CSV: %s", path.c_str());
+            } else {
+                RCLCPP_ERROR(get_logger(), "RX CSV acilamadi: %s", path.c_str());
+            }
+        }
+
         // Ucus video kaydi (opsiyonel): tespit cerceveleri + akis HUD'lu .avi.
         // Encode ayri DUSUK oncelikli thread'de -> ucus-kritik yolu (serial) yormaz.
         // Acmak icin record_video:=true. record_YYYYmmdd... record_dir'e duser.
@@ -825,6 +846,7 @@ public:
         if (tx_thread_.joinable()) tx_thread_.join();
         rx_running_ = false;                          // RX poll'u en gec 100 ms'de doner
         if (rx_thread_.joinable()) rx_thread_.join();
+        if (rx_csv_.is_open()) rx_csv_.close();       // yazan RX thread'iydi, artik durdu
 
         vpi_running_ = false;
         frame_cv_.notify_all();
@@ -1677,7 +1699,22 @@ private:
         lps::AutopilotRxParser parser(
             [this](uint8_t id, const std::vector<uint8_t> &p) { onAutopilotMsg(id, p); });
         uint8_t buf[256];
+        uint64_t s_hdr = 0, s_pay = 0, s_skip = 0, s_bytes = 0;   // ozet icin onceki degerler
+        uint64_t bytes_total = 0;
+        auto last_sum = std::chrono::steady_clock::now();
         while (rx_running_) {
+            if (rx_csv_.is_open() &&
+                std::chrono::steady_clock::now() - last_sum >= std::chrono::seconds(1)) {
+                last_sum = std::chrono::steady_clock::now();
+                rx_csv_ << msSinceStart() << ",S,,," << rx_n4a_ << ',' << rx_n4a_ok_ << ','
+                        << rx_n42_ << ',' << rx_n49_ << ',' << rx_nother_ << ','
+                        << parser.badHeader() - s_hdr << ',' << parser.badPayload() - s_pay << ','
+                        << parser.skipped() - s_skip << ',' << bytes_total - s_bytes << '\n';
+                rx_csv_.flush();   // guc kesilirse en fazla ~1 s kaybolsun
+                s_hdr = parser.badHeader(); s_pay = parser.badPayload();
+                s_skip = parser.skipped(); s_bytes = bytes_total;
+                rx_n4a_ = rx_n4a_ok_ = rx_n42_ = rx_n49_ = rx_nother_ = 0;
+            }
             struct pollfd p{serial_fd_, POLLIN, 0};
             const int r = ::poll(&p, 1, 100);
             if (r == 0) { parser.idle(); continue; }   // 100 ms sessiz: yarim cerceve gelmeyecek
@@ -1691,6 +1728,7 @@ private:
             const ssize_t n = ::read(serial_fd_, buf, sizeof(buf));
             if (n > 0) {
                 rx_bytes_ += (uint32_t)n;
+                bytes_total += (uint64_t)n;
                 parser.feed(buf, (size_t)n);
             } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
                 RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -1702,6 +1740,11 @@ private:
 
     void onAutopilotMsg(uint8_t id, const std::vector<uint8_t> &p)
     {
+        // RX CSV ozet sayaclari (sadece RX thread'i)
+        if (id == lps::AP_MSG_EKF_ALT) ++rx_n4a_;
+        else if (id == 0x42) ++rx_n42_;
+        else if (id == lps::AP_MSG_POWEROFF) ++rx_n49_;
+        else ++rx_nother_;
         if (id == lps::AP_MSG_EKF_ALT) { onEkfAlt(p); return; }
         if (id != lps::AP_MSG_POWEROFF) {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -1731,7 +1774,13 @@ private:
     void onEkfAlt(const std::vector<uint8_t> &p)
     {
         float z = 0; bool valid = false;
-        if (!lps::decodeEkfAlt(p, z, valid)) {
+        const bool ok = lps::decodeEkfAlt(p, z, valid);
+        if (rx_csv_.is_open()) {
+            rx_csv_ << msSinceStart() << ",E," << (ok ? z : 0.0f) << ',' << (ok ? (valid ? 1 : 0) : -1)
+                    << ",,,,,,,,,\n";
+        }
+        if (ok && valid) ++rx_n4a_ok_;
+        if (!ok) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                 "[SERIAL-RX] EKF yukseklik mesaji bozuk (yuk %zu B, 5 bekleniyordu ya da NaN) -> yok sayildi",
                 p.size());
@@ -2033,6 +2082,8 @@ private:
     /* RX thread - otopilot -> Jetson (0x49 KAPAT) */
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ekf_alt_pub_;   // otopilot 0x4A (RX thread)
+    std::ofstream rx_csv_;   // otopilot RX kaydi (sadece RX thread'i yazar; dtor RX join'den sonra kapatir)
+    uint32_t rx_n4a_ = 0, rx_n4a_ok_ = 0, rx_n42_ = 0, rx_n49_ = 0, rx_nother_ = 0;   // RX thread
     uint64_t ekf_alt_frames_ = 0;   // sadece RX thread'i yazar/okur
 
     std::thread           rx_thread_;

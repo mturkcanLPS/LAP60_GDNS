@@ -199,7 +199,9 @@ Servisi durdurup elle çalıştırmak için: `ros2 launch lps_bringup bringup.la
 
 **Araç boy filtresi:** İrtifa kaynağı önce otopilotun EKF yüksekliği (0x4A → serial_sender `/autopilot/ekf_altitude`'a yayınlar; LRF + baro + HRVS birleşimi, yere göre, 10 Hz), o 1.5 s gelmezse HRVS (`/hrvs/altitude`, her yeni radar karesi). Log `IRTIFA KAYNAGI X -> Y`, EO overlay'de "EKF x m" / "HRVS x m". car_detector kutunun uzun kenarını bu irtifayla metreye çevirir ve 2.5–9 m dışındaki adayları kilitlemeden eler (örneğin yerdeki ~1 m'lik tag levhası). Son irtifa 1.5 s'den eskiyse filtre kapanır. EO kaydında elenen kutular kırmızı çizilir ve yanlarında `L=…m` yazar. Kutu görüntü kenarına değiyorsa (araç kesik) alt sınır yerine kenara paralel boyutun en az 1.2 m olması aranır. Parametreler: `size_filter_enable`, `car_len_min_m`, `car_len_max_m`, `car_width_min_m`, `altitude_stale_s`.
 
-**Kayıtlar** `/home/lapis/lps_records` altına yazılır. Servis her açılışta bir oturum numarası alır (`.oturum_sayaci`). Dosya adları bu numarayı taşır (`eo_s0036_...avi`, `hrvs_s0036/`), restart olunca eski kayıtların üstüne yazılmaz.
+**İrtifa kesilirse IR/EO kararı:** Uçuşta irtifa gelmişse ve sonra kesilirse (HRVS kalkışta ölüyor, EKF ~11 m'de bloklar halinde kesilebiliyor) aktif kanal `altitude_lost_keep_s` (120 s) boyunca korunur; daha uzun kesintide EO. Açılışta hiç irtifa gelmediyse `altitude_lost_s` (10 s) sonra EO.
+
+**Kayıtlar** `/home/lapis/lps_records` altına yazılır. Servis her açılışta bir oturum numarası alır (`.oturum_sayaci`). Dosya adları bu numarayı taşır (`eo_s0036_...avi`, `hrvs_s0036/`), restart olunca eski kayıtların üstüne yazılmaz. `rx_sNNNN_*.csv`: otopilottan gelen mesajlar — her 0x4A (`E` satırı: zaman, z, gecerli) ve saniyelik özet (`S`: mesaj sayıları, bozuk çerçeve, bayt). Journal güç kesilince kaybolabildiği için RX teşhisi buradan yapılır (`rx_csv:=false` kapatır).
 
 **İzleme betikleri** (`src/lps_bringup/scripts/`, root gerekmez):
 

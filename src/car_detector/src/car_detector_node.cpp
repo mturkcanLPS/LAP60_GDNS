@@ -182,7 +182,11 @@ public:
     ir.frame_skip  = std::max(1, (int)declare_parameter<int>("ir_frame_skip", 2));
     down_m_        = declare_parameter<double>("switch_down_m", 12.0);  // alcalirken IR'ye
     up_m_          = declare_parameter<double>("switch_up_m", 18.0);    // yukselirken EO'ya
-    alt_lost_s_    = declare_parameter<double>("altitude_lost_s", 10.0); // bu kadar irtifa yok -> EO
+    alt_lost_s_    = declare_parameter<double>("altitude_lost_s", 10.0); // hic irtifa gelmediyse bu kadar sonra EO
+    // 12_11: ucusta irtifa KESILIRSE karar korunur (IR'deyse IR'de kalir), ancak bu sureden
+    // uzun kesintide EO. 148-151: HRVS kalkista oldu + EKF ~11 m'de 5-55 s kesildi -> 10 s
+    // sonra ~11 m'de EO'ya geciliyordu (EO buyuk model orada zayif, kilit kesik kesik).
+    alt_keep_s_    = declare_parameter<double>("altitude_lost_keep_s", 120.0);
     ext_topic_     = declare_parameter<std::string>("ir_to_color_extrinsics_topic",
                         "/camera/camera/extrinsics/depth_to_color");   // D4xx: depth = infra1
     if (dual_ && ir.nvinfer_cfg.empty()) {
@@ -345,6 +349,7 @@ public:
     loop_ = g_main_loop_new(nullptr, FALSE);
     gthread_ = std::thread([this]() { g_main_loop_run(loop_); });
     t_start_ = std::chrono::steady_clock::now();
+    start_ns_ = nowNs();
     updateMode();   // irtifa gelene kadar: EO (eski davranis)
 
     // Bekci: onImage ile ayni executor thread'inde -> writer_'a guvenle dokunur.
@@ -518,14 +523,17 @@ private:
   //   irtifa taze : alcalirken < down_m -> IR, yukselirken > up_m -> EO (histerezis).
   //                 [down, up] bandinda IKISI de beslenir -> gecis aninda yeni kanal kilitli.
   //   kisa bayat  : karari tut, sadece aktif beslenir (HRVS kesintisi 1-10 s goruldu).
-  //   uzun yok    : (altitude_lost_s) EO — iki kamera oncesi davranis.
+  //   uzun yok    : hic irtifa gelmediyse (acilis) altitude_lost_s sonra EO. Ucusta irtifa
+  //                 GELMIS ve kesilmisse karar altitude_lost_keep_s (120 s) korunur, sonra EO.
   void updateMode() {
     if (!dual_) { setFed(*ch_[EO], true); return; }
     std::lock_guard<std::mutex> lk(mode_mtx_);
     const int64_t now = nowNs(), t = alt_ns_.load();
     const double alt = alt_m_.load();
     const bool fresh = t != 0 && now - t <= (int64_t)(alt_stale_s_ * 1e9) && alt > 0.05;
-    const bool lost  = t == 0 || now - t > (int64_t)(alt_lost_s_ * 1e9);
+    // Hic irtifa gelmediyse altitude_lost_s; geldi ve kesildiyse altitude_lost_keep_s.
+    const bool lost  = t == 0 ? (now - start_ns_ > (int64_t)(alt_lost_s_ * 1e9))
+                              : (now - t > (int64_t)(alt_keep_s_ * 1e9));
     int act = active_.load();
     bool feedEO, feedIR;
     if (fresh) {
@@ -1240,7 +1248,8 @@ private:
   // ---- kanallar + iki kamera ----
   std::array<std::unique_ptr<Chan>, 2> ch_;
   bool   dual_ = false;
-  double down_m_ = 12.0, up_m_ = 18.0, alt_lost_s_ = 10.0;
+  double down_m_ = 12.0, up_m_ = 18.0, alt_lost_s_ = 10.0, alt_keep_s_ = 120.0;
+  int64_t start_ns_ = 0;   // node baslangici (hic irtifa gelmediyse EO karari icin)
   std::atomic<int> active_{EO};
   std::mutex mode_mtx_;
   uint32_t band_tick_ = 0;   // logBandDiff (guard timer'i)

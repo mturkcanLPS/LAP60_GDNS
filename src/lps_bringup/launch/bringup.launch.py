@@ -420,6 +420,8 @@ def generate_launch_description():
                 'ir_camera_info_topic': '/camera/camera/infra1/camera_info',
                 'switch_down_m':  ParameterValue(LaunchConfiguration('car_switch_down_m'), value_type=float),
                 'switch_up_m':    ParameterValue(LaunchConfiguration('car_switch_up_m'), value_type=float),
+                # 12_11: ucusta irtifa kesilirse IR/EO karari 120 s korunur (eskiden 10 s sonra EO).
+                'altitude_lost_keep_s': 120.0,
             }],
         )
         )
@@ -528,6 +530,8 @@ def generate_launch_description():
             # duser, HER kare yazilir (tespit olmayan kareler esik ayari icin
             # asil degerli veri). Ilk saha testlerinde ACIK tutulmasi onerilir.
             'ir_csv':        True,
+            # 12_11: otopilot RX kaydi (rx_sNNNN.csv): her 0x4A + saniyelik ozet. ~10 satir/s.
+            'rx_csv':        True,
         }],
     )
 
