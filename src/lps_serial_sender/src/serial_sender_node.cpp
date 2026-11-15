@@ -27,6 +27,7 @@
 #include <isaac_ros_apriltag_interfaces/msg/april_tag_detection_array.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/imu.hpp>          // RealSense IMU logu (15_11)
 #include <sensor_msgs/msg/range.hpp>        // HRVS irtifasi -> car_detector boy filtresi
 #include <geometry_msgs/msg/vector3_stamped.hpp>   // infra2 optik akis (x=dx y=dy z=Q)
 #include <cv_bridge/cv_bridge.h>
@@ -595,8 +596,11 @@ public:
             std::string path = lps::claimRecordPath(dir, "flow", record_session_, "csv");
             flow_csv_.open(path);
             if (flow_csv_) {
-                flow_csv_ << "t_ms,raw_dx,raw_dy,raw_q,ema_dx,ema_dy,ema_q,"
-                             "consist,tex,g50,g90\n";
+                // 15_11: kam_t = kamera cekim ani (s, header.stamp) -> IMU ile eslestirme ve
+                // kare atlama (dt) icin. all_* = filtresiz ortalama, tex_* = dokulu hucre
+                // ortalamasi (ikisi de RANSAC'siz, EMA'siz). raw_* = RANSAC sonrasi, EMA oncesi.
+                flow_csv_ << "t_ms,kam_t,all_dx,all_dy,tex_dx,tex_dy,tex_n,raw_dx,raw_dy,raw_q,"
+                             "ema_dx,ema_dy,ema_q,consist,tex,g50,g90\n";
                 flow_csv_.flush();
                 RCLCPP_INFO(get_logger(), "Ham akis CSV: %s", path.c_str());
             } else {
@@ -627,6 +631,37 @@ public:
             }
         }
 
+        // RealSense IMU logu (15_11): D435i gyro+accel (launch'ta enable_gyro/accel +
+        // unite_imu_method=2 -> tek /camera/camera/imu topic'i, gyro hizinda). Sadece CSV'ye
+        // yazilir, pakete GITMEZ. Amac: akisi donmeden arindirma / titresim analizi.
+        // stamp_s kamera kareleriyle AYNI saat (flow CSV'deki kam_t ile eslesir).
+        if (declare_parameter<bool>("imu_csv", false)) {
+            const std::string dir = has_parameter("record_dir")
+                ? get_parameter("record_dir").as_string()
+                : declare_parameter<std::string>("record_dir", "/home/lapis/lps_records");
+            const std::string path = lps::claimRecordPath(dir, "imu", record_session_, "csv");
+            imu_csv_.open(path);
+            if (imu_csv_) {
+                imu_csv_ << "t_ms,stamp_s,gx,gy,gz,ax,ay,az\n";   // rad/s, m/s^2, IMU optik cercevesi
+                imu_csv_.flush();
+                RCLCPP_INFO(get_logger(), "IMU CSV: %s", path.c_str());
+                imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+                    declare_parameter<std::string>("imu_topic", "/camera/camera/imu"),
+                    rclcpp::SensorDataQoS().keep_last(400),
+                    [this](const sensor_msgs::msg::Imu::SharedPtr m) {
+                        char line[160];
+                        std::snprintf(line, sizeof(line), "%u,%.6f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f\n",
+                            msSinceStart(), lps::stampSeconds(m->header.stamp),
+                            m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z,
+                            m->linear_acceleration.x, m->linear_acceleration.y, m->linear_acceleration.z);
+                        imu_csv_ << line;
+                        if (++imu_lines_ % 200 == 0) imu_csv_.flush();   // ~1 s'de bir
+                    });
+            } else {
+                RCLCPP_ERROR(get_logger(), "IMU CSV acilamadi: %s", path.c_str());
+            }
+        }
+
         // Otopilot -> Jetson RX kaydi (12_11): 148-151 ucuslarinda EKF yuksekligi ~11 m'de
         // 5.5 s + 8k s'lik bloklarla kesildi, journal guc kesilince kayboldugu icin sebep
         // gorulemedi. Her 0x4A (zaman, z, gecerli) + saniyede bir ozet (mesaj sayilari, bozuk
@@ -639,7 +674,10 @@ public:
             rx_csv_.open(path);
             if (rx_csv_) {
                 // tip E: 0x4A geldi (gecerli -1 = bozuk yuk). tip S: son ~1 s ozeti.
-                rx_csv_ << "t_ms,tip,ekf_z,gecerli,n_4a,n_4a_gecerli,n_42,n_49,n_diger,"
+                // 15_11: dron_baslik/yer_baslik [derece], baslik_durum (bit0-1 dron INS, 2-3 yer INS,
+                // 4 yer RTK taze) — 0x4A'nin 14 B formatinda dolar.
+                rx_csv_ << "t_ms,tip,ekf_z,gecerli,dron_baslik,yer_baslik,baslik_durum,"
+                           "n_4a,n_4a_gecerli,n_42,n_49,n_diger,"
                            "bozuk_header,bozuk_yuk,atlanan_bayt,rx_bayt\n";
                 rx_csv_.flush();
                 RCLCPP_INFO(get_logger(), "RX CSV: %s", path.c_str());
@@ -725,6 +763,9 @@ public:
         // Otopilot -> Jetson: 0x4A EKF yuksekligi (05_11). Sadece gecerli=1 iken yayinlanir;
         // car_detector boy filtresi + IR/EO gecisi icin HRVS'ten once bunu kullanir (EKF baro +
         // LRF + HRVS birlestirir, HRVS kopunca da gelir). RX thread'inden ONCE olusturulmali.
+        heading_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            declare_parameter<std::string>("heading_topic", "/autopilot/heading"),
+            rclcpp::SensorDataQoS());
         ekf_alt_pub_ = create_publisher<sensor_msgs::msg::Range>(
             declare_parameter<std::string>("ekf_altitude_topic", "/autopilot/ekf_altitude"),
             rclcpp::SensorDataQoS());
@@ -859,6 +900,7 @@ public:
 
         // CSV: VPI thread durduktan SONRA kapat (yazan o thread'di)
         if (flow_csv_.is_open()) flow_csv_.close();
+        if (imu_csv_.is_open()) imu_csv_.close();
 
         // IR CSV: yazan imgCb (ROS callback) thread'iydi; buraya spin dondukten
         // SONRA gelinir, yani callback'ler artik calismiyor - kapatmak guvenli.
@@ -1311,7 +1353,10 @@ private:
             // Ham akis CSV'si - EMA ONCESI kare-basi olcum (aciksa).
             // Yarim saniyede bir flush: ani kesintide en fazla ~15 satir kayip.
             if (flow_csv_.is_open()) {
-                flow_csv_ << of.timestamp << ','
+                char kt[32]; std::snprintf(kt, sizeof(kt), "%.6f", stamp_s);
+                flow_csv_ << of.timestamp << ',' << kt << ','
+                          << r.all_dx << ',' << r.all_dy << ','
+                          << r.tex_dx << ',' << r.tex_dy << ',' << r.tex_n << ','
                           << r.raw_dx << ',' << r.raw_dy << ','
                           << (unsigned)r.raw_quality << ','
                           << r.dx << ',' << r.dy << ',' << (unsigned)r.quality << ','
@@ -1706,7 +1751,7 @@ private:
             if (rx_csv_.is_open() &&
                 std::chrono::steady_clock::now() - last_sum >= std::chrono::seconds(1)) {
                 last_sum = std::chrono::steady_clock::now();
-                rx_csv_ << msSinceStart() << ",S,,," << rx_n4a_ << ',' << rx_n4a_ok_ << ','
+                rx_csv_ << msSinceStart() << ",S,,,,,," << rx_n4a_ << ',' << rx_n4a_ok_ << ','
                         << rx_n42_ << ',' << rx_n49_ << ',' << rx_nother_ << ','
                         << parser.badHeader() - s_hdr << ',' << parser.badPayload() - s_pay << ','
                         << parser.skipped() - s_skip << ',' << bytes_total - s_bytes << '\n';
@@ -1773,16 +1818,32 @@ private:
        yayin kesilir -> car_detector bayat sayip HRVS'e duser. */
     void onEkfAlt(const std::vector<uint8_t> &p)
     {
-        float z = 0; bool valid = false;
-        const bool ok = lps::decodeEkfAlt(p, z, valid);
+        lps::EkfAltMsg em;
+        const bool ok = lps::decodeEkfAltMsg(p, em);
+        const float z = em.z; const bool valid = em.valid;
         if (rx_csv_.is_open()) {
+            char hl[64] = ",,";
+            if (ok && em.has_heading)
+                std::snprintf(hl, sizeof(hl), "%.2f,%.2f,%u", em.drone_hdg, em.ground_hdg, (unsigned)em.status);
             rx_csv_ << msSinceStart() << ",E," << (ok ? z : 0.0f) << ',' << (ok ? (valid ? 1 : 0) : -1)
-                    << ",,,,,,,,,\n";
+                    << ',' << hl << ",,,,,,,,,\n";
+        }
+        // 15_11 (OKAD V1.1.3): dron + arac basligi -> /autopilot/heading (car_detector huni
+        // ofsetini aracin yonune gore dondurur). x = dron basligi, y = arac basligi [derece],
+        // z = baslikDurum. Gecerli EKF'ten bagimsiz yayinlanir; kullanilabilirlik durum bitlerinde.
+        if (ok && em.has_heading && heading_pub_) {
+            geometry_msgs::msg::Vector3Stamped hm;
+            hm.header.stamp = now(); hm.header.frame_id = "kuzey";
+            hm.vector.x = em.drone_hdg; hm.vector.y = em.ground_hdg; hm.vector.z = em.status;
+            heading_pub_->publish(hm);
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "[SERIAL-RX] baslik dron %.1f arac %.1f fark %+.1f derece | INS dron %d yer %d, yer taze %d",
+                em.drone_hdg, em.ground_hdg, em.relHeading(), em.droneIns(), em.groundIns(), (int)em.groundFresh());
         }
         if (ok && valid) ++rx_n4a_ok_;
         if (!ok) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                "[SERIAL-RX] EKF yukseklik mesaji bozuk (yuk %zu B, 5 bekleniyordu ya da NaN) -> yok sayildi",
+                "[SERIAL-RX] EKF yukseklik mesaji bozuk (yuk %zu B, 14 ya da 5 bekleniyordu, ya da NaN) -> yok sayildi",
                 p.size());
             return;
         }
@@ -2082,6 +2143,10 @@ private:
     /* RX thread - otopilot -> Jetson (0x49 KAPAT) */
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ekf_alt_pub_;   // otopilot 0x4A (RX thread)
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr heading_pub_;   // 0x4A basliklari
+    std::ofstream imu_csv_;   // RealSense IMU logu (sadece imu callback'i yazar)
+    uint32_t imu_lines_ = 0;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     std::ofstream rx_csv_;   // otopilot RX kaydi (sadece RX thread'i yazar; dtor RX join'den sonra kapatir)
     uint32_t rx_n4a_ = 0, rx_n4a_ok_ = 0, rx_n42_ = 0, rx_n49_ = 0, rx_nother_ = 0;   // RX thread
     uint64_t ekf_alt_frames_ = 0;   // sadece RX thread'i yazar/okur

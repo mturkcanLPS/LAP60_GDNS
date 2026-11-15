@@ -8,7 +8,9 @@
  *
  * Otopilottan gelen (02_11):
  *   0x49 KAPAT, 1 B yuk: 01 = Jetson'i kapat  ->  BB 49 01 FB 01 FF
- * Otopilottan gelen (05_11):
+ * Otopilottan gelen:
+ *   0x4A (15_11, OKAD V1.1.3): 14 B yuk = float ekfZ + uint8 gecerli + float dronBaslik +
+ *        float yerBaslik + uint8 baslikDurum. Header BB 4A 0E ED. Eski format asagida:
  *   0x4A EKF YUKSEKLIGI, 5 B yuk: float ekfZ [m] (little-endian) + uint8 gecerli
  *        (1: EKF dikey kanal hazir). Header BB 4A 05 F6. GDNS EKF'i baro + LRF +
  *        bizim gonderdigimiz HRVS'i birlestirir -> HRVS kopsa da yukseklik gelir.
@@ -33,15 +35,53 @@ constexpr uint8_t AP_SYNC_BYTE   = 0xBB;
 constexpr uint8_t AP_MSG_POWEROFF = 0x49;
 constexpr uint8_t AP_MSG_EKF_ALT  = 0x4A;
 
-/** 0x4A yukunu coz. Yuk boyu yanlis ya da deger sonlu degilse false. */
-inline bool decodeEkfAlt(const std::vector<uint8_t> &p, float &z_m, bool &valid)
+/** 0x4A icerigi. OKAD V1.1.3 (15_11): 14 B yuk = ekfZ + gecerli + dron/yer basligi + durum.
+ *  Eski 5 B yuk (sadece ekfZ + gecerli) de kabul edilir; o zaman has_heading = false. */
+struct EkfAltMsg {
+    float   z = 0.0f;            // GDNS EKF yuksekligi [m]
+    bool    valid = false;       // EKF dikey kanal hazir
+    bool    has_heading = false; // 14 B format mi
+    float   drone_hdg = 0.0f;    // dron gercek basligi [derece] 0-360, kuzey 0, saat yonu +
+    float   ground_hdg = 0.0f;   // yer (arac) VN-200 basligi [derece]
+    uint8_t status = 0;          // bit0-1 dron INS modu, bit2-3 yer INS modu, bit4 yer RTK taze
+    int  droneIns() const { return status & 0x3; }
+    int  groundIns() const { return (status >> 2) & 0x3; }
+    bool groundFresh() const { return (status & 0x10) != 0; }
+    /** Dron basligi - arac basligi, (-180, 180]. Saat yonu +. */
+    float relHeading() const {
+        float d = std::fmod(drone_hdg - ground_hdg, 360.0f);
+        if (d > 180.0f) d -= 360.0f;
+        if (d <= -180.0f) d += 360.0f;
+        return d;
+    }
+};
+
+inline bool decodeEkfAltMsg(const std::vector<uint8_t> &p, EkfAltMsg &m)
 {
-    if (p.size() != 5) return false;
+    if (p.size() != 5 && p.size() != 14) return false;
     float z;
     std::memcpy(&z, p.data(), sizeof(z));   // Jetson ve otopilot little-endian
     if (!std::isfinite(z)) return false;
-    z_m = z;
-    valid = p[4] == 1;
+    m = EkfAltMsg{};
+    m.z = z;
+    m.valid = p[4] == 1;
+    if (p.size() == 14) {
+        float dh, gh;
+        std::memcpy(&dh, p.data() + 5, sizeof(dh));
+        std::memcpy(&gh, p.data() + 9, sizeof(gh));
+        m.status = p[13];
+        m.has_heading = std::isfinite(dh) && std::isfinite(gh);
+        if (m.has_heading) { m.drone_hdg = dh; m.ground_hdg = gh; }
+    }
+    return true;
+}
+
+/** Geriye uyum (testler / eski cagri): sadece yukseklik. */
+inline bool decodeEkfAlt(const std::vector<uint8_t> &p, float &z_m, bool &valid)
+{
+    EkfAltMsg m;
+    if (!decodeEkfAltMsg(p, m)) return false;
+    z_m = m.z; valid = m.valid;
     return true;
 }
 

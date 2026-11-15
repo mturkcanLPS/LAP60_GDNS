@@ -156,6 +156,9 @@ def generate_launch_description():
     # ayni boyut (640x360). Tespit tam cozunurlukte, olcek sadece videoyu etkiler.
     car_record_arg = DeclareLaunchArgument('car_record', default_value='true')
     car_record_scale_arg = DeclareLaunchArgument('car_record_scale', default_value='0.5')
+    car_record_overlay_arg = DeclareLaunchArgument('car_record_overlay', default_value='false')
+    # RealSense IMU'sunu ac ve imu_sNNNN.csv'ye yaz. USB'de ek akis: sorun cikarirsa false.
+    imu_log_arg = DeclareLaunchArgument('imu_log', default_value='true')
     # nvvideoconvert yuzey kopyasi: 0 = varsayilan (GPU), 2 = VIC. 19_10 ucusundaki GPU
     # MMU hatasi (kopya motoru ce0, NULL adres) icin DENEME — 20_10 kullanici istegiyle acik.
     car_copy_hw_arg = DeclareLaunchArgument('car_copy_hw', default_value='2')
@@ -223,8 +226,11 @@ def generate_launch_description():
             # infra2 sadece test kaydi icin (infra2_test). Emitter kapatma ve
             # infra_profile ikisine birden uygulanir; pozlama da ORTAK (D4xx).
             'enable_infra2': LaunchConfiguration('infra2_test'),
-            'enable_gyro': 'false',
-            'enable_accel': 'false',
+            # 15_11: D435i IMU logu (imu_log). unite_imu_method 2 = gyro hizinda tek /imu topic'i
+            # (accel lineer enterpolasyon). Sadece imu_sNNNN.csv'ye yazilir.
+            'enable_gyro':  LaunchConfiguration('imu_log'),
+            'enable_accel': LaunchConfiguration('imu_log'),
+            'unite_imu_method': '2',
             'depth_module.infra_profile': ['1280x720x', LaunchConfiguration('camera_fps')],
             'depth_module.depth_profile': ['1280x720x', LaunchConfiguration('camera_fps')],
         }.items()
@@ -407,6 +413,8 @@ def generate_launch_description():
                 'mux_width':       1280,
                 'mux_height':      720,
                 'record_video':    ParameterValue(LaunchConfiguration('car_record'), value_type=bool),
+                # 15_11: EO videosu OVERLAY'SIZ (egitim verisi). Bilgiler eo_sNNNN_*.csv'de.
+                'record_overlay':  ParameterValue(LaunchConfiguration('car_record_overlay'), value_type=bool),
                 'record_scale':    ParameterValue(LaunchConfiguration('car_record_scale'), value_type=float),
                 'record_dir':      RECORD['record_dir'],
                 'record_session':  record_session,
@@ -422,6 +430,12 @@ def generate_launch_description():
                 'switch_up_m':    ParameterValue(LaunchConfiguration('car_switch_up_m'), value_type=float),
                 # 12_11: ucusta irtifa kesilirse IR/EO karari 120 s korunur (eskiden 10 s sonra EO).
                 'altitude_lost_keep_s': 120.0,
+                # 15_11: kutu merkezi -> huni ofseti (m, kamera ekseni; y + = goruntude asagi =
+                # aracin arkasi). 175/176'dan olculdu. 3 m altinda 0, 6 m ustunde tam.
+                'funnel_offset_x_m': 0.0,
+                'funnel_offset_y_m': 1.45,
+                'funnel_offset_zero_m': 3.0,
+                'funnel_offset_full_m': 6.0,
             }],
         )
         )
@@ -525,7 +539,10 @@ def generate_launch_description():
             # sahne doygunlasmaz. Video HUD'undaki blob= sayisi ile ayarlanir.
             'ir_min_threshold':  240.0,
             # Ham akis CSV logu — analiz icin, opsiyonel (varsayilan kapali).
-            # 'flow_csv':     True,
+            # 15_11: ham akis logu (flow_sNNNN.csv): filtresiz/dokulu ortalama, RANSAC sonrasi
+            # ham, EMA'li ve kamera cekim zamani. ~30 satir/s.
+            'flow_csv':     True,
+            'imu_csv':      ParameterValue(LaunchConfiguration('imu_log'), value_type=bool),
             # IR CSV logu — ucus sonrasi analiz. record_dir'e ir_YYYYmmdd...csv
             # duser, HER kare yazilir (tespit olmayan kareler esik ayari icin
             # asil degerli veri). Ilk saha testlerinde ACIK tutulmasi onerilir.
@@ -543,6 +560,8 @@ def generate_launch_description():
         enable_car_arg,
         car_record_arg,
         car_record_scale_arg,
+        car_record_overlay_arg,
+        imu_log_arg,
         car_copy_hw_arg,
         car_model_arg,
         car_dual_arg,

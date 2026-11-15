@@ -43,6 +43,11 @@ public:
         uint8_t tex_p50   = 0;    // debug: hucre gradyan medyani (≈gurultu tabani)
         uint8_t tex_p90   = 0;    // debug: hucre gradyan p90'i
         float   tex_thresh = 0;   // debug: bu karede kullanilan efektif esik
+        // EN HAM (15_11, log icin): RANSAC YOK, EMA YOK. OFA hareket vektorlerinin duz
+        // ortalamasi. all = tum hucreler; tex = sadece dokulu hucreler (doku esigi ustu).
+        float   all_dx = 0.0f, all_dy = 0.0f;
+        float   tex_dx = 0.0f, tex_dy = 0.0f;
+        int     tex_n  = 0;       // dokulu hucre sayisi (tex_dx/dy'nin ornek sayisi)
     };
 
     /** texture_thresh: doku esiginin TABANI (floor). Efektif esik sahneye
@@ -281,6 +286,21 @@ public:
         //
         // TUM yollar EMA'dan gecer — yumusatma tutarli, uzun kesinti
         // sonrasi bayat EMA problemi olusmaz (her frame gunceller).
+        // En ham olcum (log): filtresiz ortalama + sadece dokulu hucrelerin ortalamasi.
+        {
+            const cv::Scalar ma = cv::mean(flowMat);
+            out.all_dx = (float)ma[0]; out.all_dy = (float)ma[1];
+            out.tex_dx = out.all_dx;   out.tex_dy = out.all_dy; out.tex_n = 0;
+            if (!texMap.empty()) {
+                cv::Mat tmask = texMap >= (uint8_t)std::min(255.0f, tex_thresh_eff);
+                out.tex_n = cv::countNonZero(tmask);
+                if (out.tex_n > 0) {
+                    const cv::Scalar mt = cv::mean(flowMat, tmask);
+                    out.tex_dx = (float)mt[0]; out.tex_dy = (float)mt[1];
+                }
+            }
+        }
+
         cv::Vec2f gdxdy;
         float consist = 0.0f, tex_ratio = 0.0f;
         uint8_t quality;

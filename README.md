@@ -189,6 +189,9 @@ journalctl -u apriltag_bringup -f           # canlı log
 | `car_switch_down_m` / `car_switch_up_m` | `12` / `18` | Alçalırken bu irtifanın altında IR'ye, yükselirken üstünde EO'ya geçer. Arada iki model de çalışır, geçiş ~1 kare. |
 | `enable_car` | `true` | Araç tespitini aç/kapa |
 | `car_record` | `true` | EO debug videosu |
+| `car_record_overlay` | `false` | EO videosuna kutu/yazı çizilsin mi. Kapalıyken video temiz (eğitim verisi); kanal, irtifa, kilit, bearing ve kutular aynı adlı `eo_sNNNN_*.csv`'de, video karesiyle satır satır eşleşir. |
+
+**Huni ofseti:** Araç kutusunun merkezi huniyi değil aracın ortasını gösterir. car_detector gönderilen yöne `ofset / irtifa` ekler: `funnel_offset_x_m` 0, `funnel_offset_y_m` 1.45 m (kamera ekseni, y + = görüntüde aşağı = aracın arkası; 175/176 uçuşlarında araç kilidi ve tag'in birlikte olduğu 241 andan ölçüldü). 6 m üstünde tam, 3 m altında sıfır. Ofset dron başlığı = araç başlığı iken ölçüldü; 0x4A'daki başlıklarla aradaki fark kadar döndürülür (`funnel_offset_use_heading`, `heading_min_ins` 1 / `heading_max_ins` 3, `heading_stale_s`). İrtifa bayatsa ofset eklenmez. EO CSV'sinde `baslik_farki` sütunu kullanılan farkı yazar.
 | `apriltag_backend` | `cpu` | `cpu` (libapriltag) veya `gpu` (Isaac ROS) |
 | `serial_port` | `/dev/ttyTHS1` | Otopilot portu. Masa testinde sahte port (pty) verilir. |
 | `ir_alt_source` | `auto` | IR LED arama penceresi için irtifa: `auto` = otopilot EKF (0x4A), yoksa HRVS. `tag` = AprilTag z, **sadece yer/vinç testi** (içeride radar tavanı okur). Uçuşta `auto`. |
@@ -222,7 +225,7 @@ Little-endian, packed. Yapılar ve `static_assert`'ler `serial_sender_node.cpp`'
 | `0x42` | 133 B | 50 Hz | hrvs, apriltag, opticflow, ir, apriltag2, opticflow2, car |
 | `0x48` | 31 B | 1 Hz | Sistem sağlığı. Ana paketin hemen arkasından aynı thread'den yazılır. |
 | `0x49` (otopilot → Jetson) | 6 B | — | KAPAT: `BB 49 01 FB 01 FF` gelince Jetson düzgün kapanır (`systemctl poweroff`). Kapatmak için `autopilot_poweroff_enable:=false`. |
-| `0x4A` (otopilot → Jetson) | 10 B | 10 Hz | EKF yüksekliği: `BB 4A 05 F6` + `float ekfZ` [m, yere göre, yukarı +] + `uint8 gecerli` + checksum. Sadece `gecerli=1` ve > 0.1 m kullanılır (araç boy filtresi, IR/EO geçişi, IR LED penceresi). |
+| `0x4A` (otopilot → Jetson) | 19 B | 10 Hz | OKAD V1.1.3: `BB 4A 0E ED` + `float ekfZ` [m, yere göre] + `uint8 gecerli` + `float dronBaslik` + `float yerBaslik` [derece, kuzey 0, saat yönü +] + `uint8 baslikDurum` (bit0-1 dron INS, 2-3 yer INS, 4 yer RTK taze) + checksum. Eski 5 baytlık yük de okunur. Yükseklik sadece `gecerli=1` ve > 0.1 m ise kullanılır. Başlıklar `/autopilot/heading`'e gider; car_detector huni ofsetini `dron − araç` farkı kadar döndürür (iki INS modu da 0 değilse ve yer taze ise, yoksa döndürmez). |
 
 Checksum kuralı her yönde aynı: `headerchk = -(ilk 3 bayt) & 0xFF`, `chksum = -(yük baytları) & 0xFF`.
 

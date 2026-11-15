@@ -60,7 +60,9 @@
 #include <ctime>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -227,6 +229,33 @@ public:
     // (maliyet ~olcek^2). 1.0 = tam 1280x720 (eski davranis). Deger launch'ta
     // olculerek secildi (bkz. lps_bringup bringup.launch.py car_record_scale).
     record_scale_ = declare_parameter<double>("record_scale", 1.0);
+    // 15_11: false -> videoya HICBIR sey cizilmez (egitim verisi icin temiz kare). Cizilen
+    // bilgiler kaybolmasin diye her kayit karesi icin yan CSV yazilir (eo_sNNNN_*.csv:
+    // kanal, irtifa, kilit, bearing, kutular) — overlay acikken de yazilir.
+    record_overlay_ = declare_parameter<bool>("record_overlay", true);
+    // 15_11: kutu merkezi -> HUNI merkezi ofseti (metre, kamera ekseni: x saga, y asagi).
+    // Drone'un kafa acisi aracla ayni tutuldugu icin huni goruntude hep ayni yonde: kutu
+    // merkezinin ~1.45 m "altinda" (aracin arkasi). Olcum: 175/176 ucuslari, arac kilidi +
+    // tag ayni anda, 241 an -> x ~0, y +1.46 (4-14 m sabit). Gonderilen yon =
+    // kutu merkezi + ofset / irtifa. Irtifa bayatsa ofset EKLENMEZ.
+    // Alcakta arac kadraja sigmayinca kutu merkezi huniye kayiyor (2-4 m'de olculen ofset
+    // 0.5 m) -> ofset funnel_offset_zero_m altinda 0, funnel_offset_full_m ustunde tam.
+    foff_x_m_   = declare_parameter<double>("funnel_offset_x_m", 0.0);
+    foff_y_m_   = declare_parameter<double>("funnel_offset_y_m", 0.0);
+    foff_zero_m_ = declare_parameter<double>("funnel_offset_zero_m", 3.0);
+    foff_full_m_ = declare_parameter<double>("funnel_offset_full_m", 6.0);
+    // 15_11 (OKAD V1.1.3 0x4A): dron ve arac basligi geliyor. Ofset (x,y) dron basligi =
+    // arac basligi iken olculdu; fark dpsi (dron - arac, saat yonu +) ise goruntude
+    // R(-dpsi) ile dondurulur (asagi bakan kamera = aynalanmamis ustten gorunus; dron saga
+    // 90 donerse aracin arkasi goruntunun sagina gecer: (0,+1.45) -> (+1.45,0)).
+    // Baslik bayat (> heading_stale_s) ya da INS modu [heading_min_ins, heading_max_ins] disinda ya da yer RTK taze
+    // degilse dpsi = 0 (eski davranis).
+    foff_use_hdg_   = declare_parameter<bool>("funnel_offset_use_heading", true);
+    hdg_stale_s_    = declare_parameter<double>("heading_stale_s", 1.0);
+    // 15_11 (kullanici): INS modu 0 (izleme yok) DEGILSE kabul (1, 2, 3).
+    hdg_min_ins_    = (int)declare_parameter<int>("heading_min_ins", 1);
+    hdg_max_ins_    = (int)declare_parameter<int>("heading_max_ins", 3);
+    hdg_topic_      = declare_parameter<std::string>("heading_topic", "/autopilot/heading");
     if (!(record_scale_ > 0.05 && record_scale_ <= 1.0)) record_scale_ = 1.0;
     // ---- dayaniklilik (bkz. dosya basi) ----
     // nvvideoconvert yuzey kopyasi donanimi: 0 = eleman varsayilani (GPU), 1 = GPU, 2 = VIC.
@@ -323,6 +352,20 @@ public:
           alt_ns_.store(now);
           updateMode();
         });
+    // 15_11: dron/arac basligi (serial_sender, 0x4A). x dron, y arac [derece], z durum bitleri.
+    sub_hdg_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
+        hdg_topic_, qos, [this](const geometry_msgs::msg::Vector3Stamped::SharedPtr m) {
+          const int st = (int)std::lround(m->vector.z);
+          const bool ok = std::isfinite(m->vector.x) && std::isfinite(m->vector.y) &&
+                          insOk(st & 0x3) && insOk((st >> 2) & 0x3) &&
+                          (st & 0x10) != 0;
+          double d = std::fmod(m->vector.x - m->vector.y, 360.0);
+          if (d > 180.0) d -= 360.0;
+          if (d <= -180.0) d += 360.0;
+          hdg_rel_.store(d);
+          hdg_ok_.store(ok);
+          hdg_ns_.store(nowNs());
+        });
     // serial_sender sadece gecerli=1 iken yayinlar; gecersizse mesaj kesilir -> HRVS.
     if (prefer_ekf_)
       sub_ekf_ = create_subscription<sensor_msgs::msg::Range>(
@@ -379,6 +422,7 @@ public:
 
   ~CarDetector() override {
     if (writer_open_) writer_.release();   // .avi index'ini yaz (temiz kapanis)
+    if (rec_csv_.is_open()) rec_csv_.close();
     for (auto &c : ch_) {
       if (c && c->pipeline) {
         gst_element_set_state(c->pipeline, GST_STATE_NULL);
@@ -842,7 +886,7 @@ private:
     cv::cvtColor(src, bgr, cv::COLOR_RGBA2BGR);
     RecOverlay ov;
     { std::lock_guard<std::mutex> lk(c.rec_ov_mtx); ov = c.rec_ov; }
-    drawRecOverlay(bgr, ov, (float)record_scale_, dual_ ? c.name : nullptr);
+    if (record_overlay_) drawRecOverlay(bgr, ov, (float)record_scale_, dual_ ? c.name : nullptr);
 
     if (!writer_open_) {   // ilk karede ac (gercek boyutla)
       int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
@@ -853,10 +897,40 @@ private:
         return;
       }
       writer_open_ = true;
-      RCLCPP_INFO(get_logger(), "EO kaydi ACILDI (MJPG %.0ffps %dx%d, olcek %.2f) -> %s",
-                  record_fps_, bgr.cols, bgr.rows, record_scale_, record_path_.c_str());
+      RCLCPP_INFO(get_logger(), "EO kaydi ACILDI (MJPG %.0ffps %dx%d, olcek %.2f, overlay %s) -> %s",
+                  record_fps_, bgr.cols, bgr.rows, record_scale_, record_overlay_ ? "ACIK" : "KAPALI",
+                  record_path_.c_str());
+      // Yan CSV: videodaki HER kare icin bir satir (kare no = videodaki sira).
+      // Kutular mux (tam cozunurluk) koordinatinda; videoya cevirmek icin olcek ile carp.
+      const std::string csv = std::filesystem::path(record_path_).replace_extension(".csv").string();
+      rec_csv_.open(csv);
+      if (rec_csv_)
+        rec_csv_ << "kare,t_ms,kanal,irtifa_m,irtifa_kaynak,kilit_id,gecerli,bx,by,u,v,conf,olcek,baslik_farki,"
+                    "kutular(id:sol:ust:gen:yuk:conf:kilitli:elendi:boy_m|...)\n";
+      else
+        RCLCPP_ERROR(get_logger(), "EO CSV acilamadi: %s", csv.c_str());
     }
     writer_.write(bgr);
+    if (rec_csv_.is_open()) {
+      const double t_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_start_).count();
+      char line[256];
+      std::snprintf(line, sizeof(line), "%u,%.0f,%s,%.2f,%s,%ld,%d,%.5f,%.5f,%.1f,%.1f,%.2f,%.2f,",
+                    rec_frames_, t_ms, c.name, ov.alt, ov.alt >= 0 ? altSrcName(ov.alt_src) : "-",
+                    ov.locked_id, ov.valid ? 1 : 0, ov.bx, ov.by, ov.u, ov.v, ov.conf, record_scale_);
+      rec_csv_ << line;
+      const double dps = relHeadingDeg();
+      if (std::isfinite(dps)) { std::snprintf(line, sizeof(line), "%.1f,", dps); rec_csv_ << line; }
+      else rec_csv_ << ',';
+      for (size_t i = 0; i < ov.boxes.size(); ++i) {
+        const auto &b = ov.boxes[i];
+        std::snprintf(line, sizeof(line), "%s%ld:%.0f:%.0f:%.0f:%.0f:%.2f:%d:%d:%.2f", i ? "|" : "",
+                      b.id, b.left, b.top, b.w, b.h, b.conf, b.locked ? 1 : 0, b.rejected ? 1 : 0, b.len_m);
+        rec_csv_ << line;
+      }
+      rec_csv_ << '\n';
+      if (++rec_frames_ % 15 == 0) rec_csv_.flush();   // guc kesilirse en fazla ~1 s kayip
+    }
   }
 
   // k: kayit olcegi — kutular mux (tam cozunurluk) koordinatinda, kareyle birlikte olceklenir
@@ -1193,6 +1267,25 @@ private:
     cv::undistortPoints(in, out, K, D);   // normalize (X/Z, Y/Z), bu kameranin cercevesi
     double bx = out[0].x, by = out[0].y;
     if (c.idx == IR) irToColor(bx, by);  // paket RENKLI kamera cercevesinde kalsin
+    // Huni ofseti: sadece taze irtifayla (yoksa kutu merkezi gider).
+    if (foff_x_m_ != 0.0 || foff_y_m_ != 0.0) {
+      const int64_t ta = alt_ns_.load();
+      const double alt = alt_m_.load();
+      if (ta != 0 && nowNs() - ta <= (int64_t)(alt_stale_s_ * 1e9) && alt > 0.5) {
+        double k = 1.0;
+        if (foff_full_m_ > foff_zero_m_)
+          k = std::clamp((alt - foff_zero_m_) / (foff_full_m_ - foff_zero_m_), 0.0, 1.0);
+        double ox = foff_x_m_, oy = foff_y_m_;
+        const double dpsi = relHeadingDeg();   // NaN: kullanilamaz -> dondurme yok
+        if (std::isfinite(dpsi)) {
+          const double a = -dpsi * M_PI / 180.0, ca = std::cos(a), sa = std::sin(a);
+          const double rx = ca * ox - sa * oy, ry = sa * ox + ca * oy;
+          ox = rx; oy = ry;
+        }
+        bx += k * ox / alt;
+        by += k * oy / alt;
+      }
+    }
     c.pub_bx = bx; c.pub_by = by; c.pub_valid = true;  // display icin sakla
     if (c.idx != active_.load()) return;  // isinma kanali: kilit tutar, yayinlamaz
     geometry_msgs::msg::Vector3Stamped m;
@@ -1272,6 +1365,27 @@ private:
   // ---- OpenCV recorder (IR-tarzi: VideoWriter MJPG .avi, kare kare) ----
   cv::VideoWriter writer_;
   bool         writer_open_ = false;
+  bool         record_overlay_ = true;
+  double       foff_x_m_ = 0.0, foff_y_m_ = 0.0, foff_zero_m_ = 3.0, foff_full_m_ = 6.0;
+  // dron - arac basligi (0x4A, serial_sender -> /autopilot/heading)
+  bool         foff_use_hdg_ = true;
+  double       hdg_stale_s_ = 1.0;
+  int          hdg_min_ins_ = 1, hdg_max_ins_ = 3;
+  bool insOk(int m) const { return m >= hdg_min_ins_ && m <= hdg_max_ins_; }
+  std::string  hdg_topic_;
+  std::atomic<double>  hdg_rel_{0.0};
+  std::atomic<bool>    hdg_ok_{false};
+  std::atomic<int64_t> hdg_ns_{0};
+  rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr sub_hdg_;
+  /** Kullanilabilir dron - arac basligi farki [derece], yoksa NaN. */
+  double relHeadingDeg() const {
+    if (!foff_use_hdg_ || !hdg_ok_.load()) return std::nan("");
+    const int64_t t = hdg_ns_.load();
+    if (t == 0 || nowNs() - t > (int64_t)(hdg_stale_s_ * 1e9)) return std::nan("");
+    return hdg_rel_.load();
+  }
+  std::ofstream rec_csv_;      // yan CSV (recordFrame ile ayni thread)
+  uint32_t     rec_frames_ = 0;
 
   // ---- gstreamer ----
   GMainLoop *loop_ = nullptr;

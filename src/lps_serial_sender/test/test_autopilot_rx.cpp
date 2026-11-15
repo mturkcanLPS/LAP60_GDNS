@@ -115,6 +115,29 @@ int main()
         CHECK(!lps::decodeEkfAlt(std::vector<uint8_t>(n.begin() + 4, n.begin() + 9), z, ok), "NaN reddedildi");
     }
 
+    std::printf("0x4A yeni format (OKAD V1.1.3, 14 B yuk: yukseklik + dron/yer basligi)\n");
+    {
+        // Dokumandaki ornek: ekfZ 12.34, gecerli 1, dron 80.5, yer 80.2, durum 0x15
+        const std::vector<uint8_t> f = {0xBB, 0x4A, 0x0E, 0xED, 0xA4, 0x70, 0x45, 0x41, 0x01, 0x00, 0x00,
+                                        0xA1, 0x42, 0x66, 0x66, 0xA0, 0x42, 0x15, 0xBF};
+        Rec r; for (uint8_t b : f) r.p.feed(&b, 1);
+        CHECK(r.got.size() == 1 && r.got[0].first == 0x4A && r.got[0].second.size() == 14,
+              "dokuman ornegi cerceve olarak alindi (checksum tutuyor)");
+        lps::EkfAltMsg m;
+        const bool ok = r.got.size() == 1 && lps::decodeEkfAltMsg(r.got[0].second, m);
+        CHECK(ok && std::fabs(m.z - 12.34f) < 1e-4f && m.valid, "ekfZ 12.34, gecerli 1");
+        CHECK(ok && m.has_heading && std::fabs(m.drone_hdg - 80.5f) < 1e-4f && std::fabs(m.ground_hdg - 80.2f) < 1e-4f,
+              "dron 80.5, yer 80.2 derece");
+        CHECK(ok && m.droneIns() == 1 && m.groundIns() == 1 && m.groundFresh(), "durum 0x15: dron INS 1, yer INS 1, yer taze");
+        CHECK(ok && std::fabs(m.relHeading() - 0.3f) < 1e-3f, "baslik farki +0.3");
+        float z = 0; bool v = false;
+        CHECK(lps::decodeEkfAlt(r.got[0].second, z, v) && std::fabs(z - 12.34f) < 1e-4f && v, "eski cagri yeni formati da okur");
+        lps::EkfAltMsg w; w.drone_hdg = 5.0f; w.ground_hdg = 355.0f;
+        lps::EkfAltMsg w2; w2.drone_hdg = 350.0f; w2.ground_hdg = 10.0f;
+        CHECK(std::fabs(w.relHeading() - 10.0f) < 1e-3f && std::fabs(w2.relHeading() + 20.0f) < 1e-3f,
+              "kuzeyden gecis: 5-355 = +10, 350-10 = -20");
+    }
+
     std::printf("rastgele gurultu (20 MB) -> yanlis KAPAT yok\n");
     {
         Rec r; std::mt19937 rng(12345); std::uniform_int_distribution<int> d(0, 255);
