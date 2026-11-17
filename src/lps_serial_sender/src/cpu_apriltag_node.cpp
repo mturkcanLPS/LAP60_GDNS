@@ -19,6 +19,7 @@
 #include "lps_serial_sender/stamp_seconds.hpp"     // damga -> saniye, istisnasiz (20_10)
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/range.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 #include <isaac_ros_apriltag_interfaces/msg/april_tag_detection_array.hpp>
@@ -85,6 +86,24 @@ public:
         max_hamming_ = std::clamp((int)declare_parameter<int>("max_hamming", 1), 0, 3);
         min_margin_  = declare_parameter<double>("min_decision_margin", 30.0);
 
+        // --- Irtifa kapisi (17_11): tag ~10 m'den itibaren okunuyor; ustunde tespit bosa CPU
+        //     yakar (iki ornek ~2 cekirdek). alt_on_m altinda ACIK, alt_off_m ustunde KAPALI
+        //     (arada histerezis). Kaynak: EKF (0x4A), tazeyse; yoksa HRVS. IRTIFA BILINMIYORSA
+        //     ACIK (guvenli taraf). Kapaliyken tespit yapilmaz, BOS dizi yayinlanir.
+        alt_gate_en_ = declare_parameter<bool>("alt_gate_enable", false);
+        alt_on_m_    = declare_parameter<double>("alt_on_m", 11.0);
+        alt_off_m_   = std::max(alt_on_m_, declare_parameter<double>("alt_off_m", 12.0));
+        alt_stale_s_ = declare_parameter<double>("altitude_stale_s", 1.5);
+        if (alt_gate_en_) {
+            const auto qos = rclcpp::SensorDataQoS();
+            ekf_sub_ = create_subscription<sensor_msgs::msg::Range>(
+                declare_parameter<std::string>("ekf_altitude_topic", "/autopilot/ekf_altitude"), qos,
+                [this](const sensor_msgs::msg::Range::SharedPtr m) { ekf_m_ = m->range; ekf_t_ = steadyS(); });
+            hrvs_sub_ = create_subscription<sensor_msgs::msg::Range>(
+                declare_parameter<std::string>("hrvs_altitude_topic", "/hrvs/altitude"), qos,
+                [this](const sensor_msgs::msg::Range::SharedPtr m) { hrvs_m_ = m->range; hrvs_t_ = steadyS(); });
+        }
+
         td_ = apriltag_detector_create();
         tf_ = makeFamily(family_name_);
         if (!tf_) {
@@ -117,6 +136,9 @@ public:
             "sigma=%.1f max_hamming=%d min_margin=%.0f | %s -> %s",
             family_name_.c_str(), tag_size_, quad_decimate, decode_sharpen,
             quad_sigma, max_hamming_, min_margin_, image_topic_.c_str(), output_topic_.c_str());
+        if (alt_gate_en_)
+            RCLCPP_INFO(get_logger(), "Irtifa kapisi: <= %.1f m ACIK, > %.1f m KAPALI (EKF, yoksa HRVS; "
+                        "irtifa yoksa ACIK)", alt_on_m_, alt_off_m_);
     }
 
     ~CpuAprilTagNode()
@@ -209,6 +231,12 @@ private:
         }
         if (every_n_ > 1 && !scheduledFrame(lps::stampSeconds(msg->header.stamp)))
             return;   // takvim disi kare: yayin YOK (tag hizi = kamera_fps / N, sabit)
+        if (!altGateOpen()) {   // yuksekte: tespit yok, bos dizi (alicilar "tag yok" gorur)
+            isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray empty;
+            empty.header = msg->header;
+            pub_->publish(empty);
+            return;
+        }
         cv::Mat gray;
         try {
             gray = cv_bridge::toCvShare(msg, "mono8")->image;
@@ -279,6 +307,35 @@ private:
         }
     }
 
+    static double steadyS()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    /** Irtifa kapisi: EKF tazeyse EKF, degilse HRVS, ikisi de yoksa ACIK (guvenli). */
+    bool altGateOpen()
+    {
+        if (!alt_gate_en_) return true;
+        const double t = steadyS();
+        double alt = -1.0; const char *src = "-";
+        if (ekf_t_ > 0 && t - ekf_t_ <= alt_stale_s_ && std::isfinite(ekf_m_)) { alt = ekf_m_; src = "EKF"; }
+        else if (hrvs_t_ > 0 && t - hrvs_t_ <= alt_stale_s_ && std::isfinite(hrvs_m_) && hrvs_m_ > 0.0) {
+            alt = hrvs_m_; src = "HRVS";
+        }
+        bool open = gate_open_;
+        if (alt < 0.0)               open = true;    // irtifa bilinmiyor -> tespit ACIK
+        else if (alt > alt_off_m_)   open = false;
+        else if (alt <= alt_on_m_)   open = true;
+        if (open != gate_open_) {
+            if (alt < 0.0)
+                RCLCPP_INFO(get_logger(), "[TAG-IRTIFA] AprilTag ACIK (irtifa yok -> guvenli taraf)");
+            else
+                RCLCPP_INFO(get_logger(), "[TAG-IRTIFA] AprilTag %s (%s %.1f m, esik %.1f/%.1f m)",
+                            open ? "ACIK" : "KAPALI", src, alt, alt_on_m_, alt_off_m_);
+            gate_open_ = open;
+        }
+        return open;
+    }
+
     // params
     std::string image_topic_, cinfo_topic_, output_topic_, family_name_;
     double tag_size_ = 0.25;
@@ -301,6 +358,12 @@ private:
     rclcpp::Publisher<isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>::SharedPtr pub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cinfo_sub_;
+
+    // irtifa kapisi (tek thread'li executor: kilit gerekmez)
+    bool   alt_gate_en_ = false, gate_open_ = true;
+    double alt_on_m_ = 11.0, alt_off_m_ = 12.0, alt_stale_s_ = 1.5;
+    double ekf_m_ = 0, ekf_t_ = 0, hrvs_m_ = 0, hrvs_t_ = 0;
+    rclcpp::Subscription<sensor_msgs::msg::Range>::SharedPtr ekf_sub_, hrvs_sub_;
 };
 
 int main(int argc, char **argv)

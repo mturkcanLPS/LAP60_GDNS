@@ -617,13 +617,16 @@ public:
             } else {
                 RCLCPP_ERROR(get_logger(), "Akis CSV acilamadi: %s", path.c_str());
             }
-            // 19_11: OF2 (infra2) gyroflow kaydi. all_dx/all_dy filtresiz girdi, comp_* pakete giden.
-            if (has_parameter("gyroflow_enable") ? get_parameter("gyroflow_enable").as_bool()
-                                                  : declare_parameter<bool>("gyroflow_enable", true)) {
+            // 19_11: OF2 (infra2) gyroflow kaydi. gir_dx/gir_dy gyroflow girdisi, comp_* pakete giden.
+            // Sadece OF2 aciksa (of2_enable) acilir.
+            const bool of2_on = has_parameter("of2_enable") ? get_parameter("of2_enable").as_bool()
+                                                            : declare_parameter<bool>("of2_enable", false);
+            if (of2_on && (has_parameter("gyroflow_enable") ? get_parameter("gyroflow_enable").as_bool()
+                                                  : declare_parameter<bool>("gyroflow_enable", true))) {
                 const std::string p2 = lps::claimRecordPath(dir, "flow2", record_session_, "csv");
                 flow2_csv_.open(p2);
                 if (flow2_csv_) {
-                    flow2_csv_ << "t_ms,kam_t,all_dx,all_dy,q,comp_dx_kare,comp_dy_kare,durum\n";
+                    flow2_csv_ << "t_ms,kam_t,gir_dx,gir_dy,q,comp_dx_kare,comp_dy_kare,durum\n";
                     RCLCPP_INFO(get_logger(), "OF2 gyroflow CSV: %s", p2.c_str());
                 }
             }
@@ -810,6 +813,13 @@ public:
         // dx=dy=0, quality=0 gonderilir -> otopilot "olcum yok"u acikca gorur. false -> OKAD dokumanindaki
         // eski davranis (paket guncellenmez, eski deger eski timestamp ile kalir).
         gf_invalid_q0_ = declare_parameter<bool>("gyroflow_invalid_q0", true);
+        // 17_11: gyroflow girdisi. "raw" (varsayilan) = RANSAC'li, EMA'siz akis + o karenin kalitesi;
+        // RANSAC model bulamazsa kare gecersiz (durum 4). "all" = tum hucre ortalamasi (OKAD ilk surum),
+        // quality EMA'li. Masa (s0207): raw gurultusu all'in ~yarisi, |p99| 2.5 kat az.
+        gf_input_raw_ = declare_parameter<std::string>("gyroflow_input", "raw") != "all";
+        // 17_11: OF2 (infra2 akisi). Kapaliyken opticflow2 alani sifir (quality 0) gider.
+        of2_en_ = has_parameter("of2_enable") ? get_parameter("of2_enable").as_bool()
+                                               : declare_parameter<bool>("of2_enable", false);
         infra2_flow_raw_topic_ = declare_parameter<std::string>("infra2_flow_raw_topic", "/infra2/optical_flow_raw");
         // Akis birlesimi (infra1+infra2 ortalamasi -> opticflow). Gyroflow ile KAPALI: OF1/OF2 ayri gider.
         flow_fusion_ = declare_parameter<bool>("flow_fusion", !gyroflow_en_);
@@ -853,7 +863,9 @@ public:
             isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>(
             infra2_tag_topic_, rclcpp::SensorDataQoS(),
             std::bind(&SerialSenderNode::tagCb2, this, std::placeholders::_1));
-        if (gyroflow_en_)
+        if (!of2_en_)
+            RCLCPP_INFO(get_logger(), "OF2 (infra2 akisi) KAPALI: opticflow2 alani sifir / quality 0 gider (of2_enable)");
+        else if (gyroflow_en_)
             flow2_raw_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
                 infra2_flow_raw_topic_, rclcpp::SensorDataQoS(),
                 std::bind(&SerialSenderNode::flowRawCb2, this, std::placeholders::_1));
@@ -1043,21 +1055,24 @@ private:
     void processFlow2(double tK, double tO, float dx, float dy, uint8_t q, bool from_imu, bool force = false)
     {
         GyroFlowSonuc gs;
+        const bool in_ok = !gf_input_raw_ || q > 0;   // raw: infra2_recorder RANSAC yoksa q=0 yollar
         GyroFlowDurum d = tO > 0.0 ? gf2_.hesapla(tK, tO, dx, dy, gs) : GyroFlowDurum::KareAraligi;
-        if (d == GyroFlowDurum::GyroGelmedi && !force) {
+        if (in_ok && d == GyroFlowDurum::GyroGelmedi && !force) {
             pend2_ = {true, tK, tO, dx, dy, q};
             if (!from_imu) return;
             if (lps::stampSeconds(now()) - tK < 0.05) return;   // IMU hala bekleniyor
         }
         pend2_.active = false;
-        gfCount(2, d);
+        const int dd = in_ok ? (int)d : GF_AKIS_YOK;
+        gfCount(2, dd);
+        if (!in_ok) d = GyroFlowDurum::GyroYok;   // asagida gecersiz yolu (CSV'ye dd yazilir)
         if (flow2_csv_.is_open()) {
             char b[160];
             if (d == GyroFlowDurum::Tamam)
                 std::snprintf(b, sizeof(b), "%u,%.6f,%.4f,%.4f,%u,%.4f,%.4f,0\n", msSinceStart(), tK, dx, dy, q,
                               gs.comp_dx_kare, gs.comp_dy_kare);
             else
-                std::snprintf(b, sizeof(b), "%u,%.6f,%.4f,%.4f,%u,,,%d\n", msSinceStart(), tK, dx, dy, q, (int)d);
+                std::snprintf(b, sizeof(b), "%u,%.6f,%.4f,%.4f,%u,,,%d\n", msSinceStart(), tK, dx, dy, q, dd);
             flow2_csv_ << b;
             if (++flow2_lines_ % 15 == 0) flow2_csv_.flush();
         }
@@ -1071,13 +1086,21 @@ private:
         std::lock_guard<std::mutex> lk(data_mutex_);
         opticflow2_ = of;
     }
-    void gfCount(int cam, GyroFlowDurum d)
+    // durum: 0 tamam, 1 gyro gelmedi, 2 gyro yok, 3 kare araligi, 4 akis yok (RANSAC model bulamadi)
+    static constexpr int GF_AKIS_YOK = 4;
+    void gfCount(int cam, int d)
     {
-        gf_cnt_[cam - 1][(int)d].fetch_add(1);
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
-            "[GYROFLOW] OF1 tamam %u gelmedi %u gyro-yok %u aralik %u | OF2 tamam %u gelmedi %u gyro-yok %u aralik %u",
-            gf_cnt_[0][0].load(), gf_cnt_[0][1].load(), gf_cnt_[0][2].load(), gf_cnt_[0][3].load(),
-            gf_cnt_[1][0].load(), gf_cnt_[1][1].load(), gf_cnt_[1][2].load(), gf_cnt_[1][3].load());
+        gf_cnt_[cam - 1][d].fetch_add(1);
+        auto& a = gf_cnt_[0]; auto& b = gf_cnt_[1];
+        if (of2_en_)
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                "[GYROFLOW] (%s) OF1 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u | OF2 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u",
+                gf_input_raw_ ? "raw" : "all", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load(),
+                b[0].load(), b[1].load(), b[2].load(), b[3].load(), b[4].load());
+        else
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                "[GYROFLOW] (%s) OF1 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u | OF2 kapali",
+                gf_input_raw_ ? "raw" : "all", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load());
     }
 
     void flowCb2(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
@@ -1446,16 +1469,25 @@ private:
                 const double t_prev = gf_prev1_;
                 gf_prev1_ = stamp_s;
                 GyroFlowDurum d = GyroFlowDurum::KareAraligi;
-                if (t_prev > 0.0) {
+                const float in_dx = gf_input_raw_ ? r.raw_dx : r.all_dx;
+                const float in_dy = gf_input_raw_ ? r.raw_dy : r.all_dy;
+                const bool  in_ok = !gf_input_raw_ || (r.raw_ok && r.raw_quality > 0);
+                if (!in_ok) {
+                    gd = GF_AKIS_YOK;   // RANSAC model bulamadi
+                } else if (t_prev > 0.0) {
                     for (int k = 0; k < 10; ++k) {   // en fazla ~30 ms
-                        d = gf1_.hesapla(stamp_s, t_prev, r.all_dx, r.all_dy, gs);
+                        d = gf1_.hesapla(stamp_s, t_prev, in_dx, in_dy, gs);
                         if (d != GyroFlowDurum::GyroGelmedi || !vpi_running_) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(3));
                     }
                 }
-                gd = (int)d; gfCount(1, d);
-                of_ok = d == GyroFlowDurum::Tamam;
-                if (of_ok) { of.motionPos.x = gs.comp_dx_kare; of.motionPos.y = gs.comp_dy_kare; }
+                if (gd != GF_AKIS_YOK) gd = (int)d;
+                gfCount(1, gd);
+                of_ok = gd == (int)GyroFlowDurum::Tamam;
+                if (of_ok) {
+                    of.motionPos.x = gs.comp_dx_kare; of.motionPos.y = gs.comp_dy_kare;
+                    if (gf_input_raw_) of.quality = r.raw_quality;   // gonderilen olcumun kendi kalitesi
+                }
                 else if (gf_invalid_q0_) { of.motionPos.x = 0.f; of.motionPos.y = 0.f; of.quality = 0; }
             }
 
@@ -1749,7 +1781,7 @@ private:
                     at2_copy.avgPos.pos.x, at2_copy.avgPos.pos.y, at2_copy.avgPos.pos.z,
                     at2_copy.avgPos.angle.roll, at2_copy.avgPos.angle.pitch,
                     at2_copy.avgPos.angle.yaw);
-                RCLCPP_INFO(get_logger(),
+                if (of2_en_) RCLCPP_INFO(get_logger(),
                     "[OPTICFLOW2] %.1f Hz | dx=%.3f dy=%.3f quality=%u",
                     flow2_hz, of2_copy.motionPos.x, of2_copy.motionPos.y, of2_copy.quality);
                 // Pakete GIDEN birlesik deger + son 1 s'de kaynak dagilimi (TX tick'i basina).
@@ -2268,11 +2300,12 @@ private:
     bool             imu_enable_ = false;
     // 19_11 gyroflow (OF1 = infra1, OF2 = infra2; ayni IMU)
     bool             gyroflow_en_ = true, flow_fusion_ = false, gf_invalid_q0_ = true;
+    bool             gf_input_raw_ = true, of2_en_ = false;
     GyroFlow         gf1_, gf2_;
     double           gf_prev1_ = 0.0;   // VPI thread'i
     double           gf_prev2_ = 0.0;   // executor
     struct Pend2 { bool active = false; double tK = 0, tO = 0; float dx = 0, dy = 0; uint8_t q = 0; } pend2_;
-    std::atomic<uint32_t> gf_cnt_[2][4] = {};
+    std::atomic<uint32_t> gf_cnt_[2][5] = {};
     std::string      infra2_flow_raw_topic_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr flow2_raw_sub_;
     std::ofstream    flow2_csv_;

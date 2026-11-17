@@ -159,6 +159,22 @@ def generate_launch_description():
     car_record_overlay_arg = DeclareLaunchArgument('car_record_overlay', default_value='false')
     # RealSense IMU'sunu ac ve imu_sNNNN.csv'ye yaz. USB'de ek akis: sorun cikarirsa false.
     imu_log_arg = DeclareLaunchArgument('imu_log', default_value='true')
+    # 17_11: gyroflow girdisi. raw = RANSAC'li, EMA'siz akis + o karenin kalitesi (masada gurultu
+    # all'in ~yarisi). all = tum hucre ortalamasi (OKAD ilk surum).
+    gyroflow_input_arg = DeclareLaunchArgument('gyroflow_input', default_value='raw')
+    # 17_11: OF2 (infra2 optik akisi). Kapali: opticflow2 alani sifir/quality 0, infra2 VPI
+    # akisi hesaplanmaz (~0.3 cekirdek + OFA infra1'e kalir). infra2 tag + video devam eder.
+    of2_arg = DeclareLaunchArgument('of2', default_value='false')
+    # 17_11: AprilTag irtifa kapisi. Tag ~10 m'den okunuyor; <= on_m ACIK, > off_m KAPALI
+    # (histerezis). EKF, yoksa HRVS; irtifa bilinmiyorsa ACIK.
+    apriltag_alt_gate_arg = DeclareLaunchArgument('apriltag_alt_gate', default_value='true')
+    apriltag_on_m_arg = DeclareLaunchArgument('apriltag_on_m', default_value='11.0')
+    apriltag_off_m_arg = DeclareLaunchArgument('apriltag_off_m', default_value='12.0')
+    TAG_ALT_GATE = {
+        'alt_gate_enable': ParameterValue(LaunchConfiguration('apriltag_alt_gate'), value_type=bool),
+        'alt_on_m':        ParameterValue(LaunchConfiguration('apriltag_on_m'), value_type=float),
+        'alt_off_m':       ParameterValue(LaunchConfiguration('apriltag_off_m'), value_type=float),
+    }
     # nvvideoconvert yuzey kopyasi: 0 = varsayilan (GPU), 2 = VIC. 19_10 ucusundaki GPU
     # MMU hatasi (kopya motoru ce0, NULL adres) icin DENEME — 20_10 kullanici istegiyle acik.
     car_copy_hw_arg = DeclareLaunchArgument('car_copy_hw', default_value='2')
@@ -310,6 +326,7 @@ def generate_launch_description():
             'image_topic':       '/camera/camera/infra1/image_rect_raw',
             'camera_info_topic': '/camera/camera/infra1/camera_info',
             'output_topic':      '/tag_detections',
+            **TAG_ALT_GATE,
             'tag_family':        LaunchConfiguration('tag_family'),
             'process_every_n':   APRILTAG_EVERY_N,
             'camera_fps':        CAMERA_FPS,
@@ -334,6 +351,7 @@ def generate_launch_description():
             'image_topic':       '/camera/camera/infra2/image_rect_raw',
             'camera_info_topic': '/camera/camera/infra2/camera_info',
             'output_topic':      INFRA2_TAG_TOPIC,
+            **TAG_ALT_GATE,
             'tag_family':        LaunchConfiguration('tag_family'),
             'process_every_n':   APRILTAG_EVERY_N,
             'camera_fps':        CAMERA_FPS,
@@ -367,9 +385,10 @@ def generate_launch_description():
             'record_prefix':      'lps_infra2',
             'record_session':     record_session,
             'record_label':       'INFRA2 (seriale giden: aprtiltag2/opticflow2)',
-            # OFA donanimi infra1 akisiyla paylasiliyor. serial_sender logundaki
-            # '[OPTICFLOW] Hz' ~30'un altina duserse False yap (sadece tag kaydi).
-            'flow_enabled':       True,
+            # OFA donanimi infra1 akisiyla paylasiliyor. 17_11: 'of2' launch argumani
+            # (varsayilan false) -> sadece tag kaydi, OF2 hesaplanmaz.
+            'flow_enabled':       ParameterValue(LaunchConfiguration('of2'), value_type=bool),
+            'gyroflow_input':     LaunchConfiguration('gyroflow_input'),
         }],
     )
 
@@ -545,6 +564,8 @@ def generate_launch_description():
             # IMU (imu_log): 200 Hz ham IMU ayri dosyada (imu_sNNNN.csv), akis ayri (flow_sNNNN.csv).
             'imu_enable':   ParameterValue(LaunchConfiguration('imu_log'), value_type=bool),
             'imu_csv':      ParameterValue(LaunchConfiguration('imu_log'), value_type=bool),
+            'gyroflow_input': LaunchConfiguration('gyroflow_input'),
+            'of2_enable':   ParameterValue(LaunchConfiguration('of2'), value_type=bool),
             # IR CSV logu — ucus sonrasi analiz. record_dir'e ir_YYYYmmdd...csv
             # duser, HER kare yazilir (tespit olmayan kareler esik ayari icin
             # asil degerli veri). Ilk saha testlerinde ACIK tutulmasi onerilir.
@@ -568,6 +589,11 @@ def generate_launch_description():
         car_record_scale_arg,
         car_record_overlay_arg,
         imu_log_arg,
+        gyroflow_input_arg,
+        of2_arg,
+        apriltag_alt_gate_arg,
+        apriltag_on_m_arg,
+        apriltag_off_m_arg,
         car_copy_hw_arg,
         car_model_arg,
         car_dual_arg,

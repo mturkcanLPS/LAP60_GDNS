@@ -34,8 +34,8 @@ Uçuş kayıtları (`/home/lapis/lps_records`, video/CSV) repoda **yok**; boyutl
 ## Şu anki durum (17_11)
 
 **Otopilota giden veriler**
-- AprilTag (`aprtiltag`): infra1 + infra2 birleşimi, huni tag'leri tag25h9, referans = küçük tag plakası. Kısa tag görüşleri otopilota gitmiyor: 3 ardışık tespit, 1.0 s kalma (`tag_gate.hpp`).
-- Optik akış (`opticflow` = infra1, `opticflow2` = infra2): OKAD gyroflow, filtresiz akış − RealSense gyro dönmesi (`gyroflow.hpp`). **Otopilot V1.1.3 bu formatı bilmiyor → otopilot güncellenene kadar GPS'li modda uçulmalı.** Gyroflow geçersizse pakete yeni timestamp ile `0/0, quality=0` gider (`gyroflow_invalid_q0`; OKAD dokümanından bilinçli sapma, OKAD'a bildirilmeli). NTP saat adımı gyro tamponunu donduruyordu → 17_11 düzeltildi (`test_gyroflow`).
+- AprilTag (`aprtiltag`): infra1 + infra2 birleşimi, huni tag'leri tag25h9, referans = küçük tag plakası. Kısa tag görüşleri otopilota gitmiyor: 3 ardışık tespit, 1.0 s kalma (`tag_gate.hpp`). 17_11: AprilTag yalnız ≤ 11 m'de çalışıyor (> 12 m kapalı, irtifa yoksa açık).
+- Optik akış (`opticflow` = infra1; `opticflow2` = infra2, 17_11'den beri varsayılan KAPALI): OKAD gyroflow, RANSAC'lı EMA'sız akış (`gyroflow_input:=raw`) − RealSense gyro dönmesi (`gyroflow.hpp`). **Otopilot V1.1.3 bu formatı bilmiyor → otopilot güncellenene kadar GPS'li modda uçulmalı.** Gyroflow geçersizse pakete yeni timestamp ile `0/0, quality=0` gider (`gyroflow_invalid_q0`; OKAD dokümanından bilinçli sapma, OKAD'a bildirilmeli). NTP saat adımı gyro tamponunu donduruyordu → 17_11 düzeltildi (`test_gyroflow`).
 - Araç bearing'i (`car`): kutu merkezi + huni ofseti (y +1.45 m, kamera ekseni), dron−araç başlık farkıyla döndürülüyor (0x4A'daki başlıklar).
 - IR LED üçgeni (`ir`): yüksekliğe göre LED penceresi, gerçek üçgen ölçüleri (R–sağ 1.445 m, R–sol 1.31 m), huni merkezi düzeltmesi. Gündüz güneş parlamasında çalışmıyor (beklenen).
 

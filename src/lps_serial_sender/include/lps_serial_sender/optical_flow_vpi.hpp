@@ -48,6 +48,7 @@ public:
         float   all_dx = 0.0f, all_dy = 0.0f;
         float   tex_dx = 0.0f, tex_dy = 0.0f;
         int     tex_n  = 0;       // dokulu hucre sayisi (tex_dx/dy'nin ornek sayisi)
+        bool    raw_ok = false;   // 17_11: RANSAC global model buldu (false -> raw = duz ortalama yedegi)
     };
 
     /** texture_thresh: doku esiginin TABANI (floor). Efektif esik sahneye
@@ -317,11 +318,13 @@ public:
             if (q < 0.0f)   q = 0.0f;
             if (q > 100.0f) q = 100.0f;
             quality = static_cast<uint8_t>(q);
+            out.raw_ok = true;
         } else {
             // Tutarli global model yok — mean fallback, dusuk guven
             cv::Scalar m = cv::mean(flowMat);
             gdxdy = cv::Vec2f((float)m[0], (float)m[1]);
             quality = QUALITY_UNRELIABLE;
+            out.raw_ok = false;
         }
         // HAM degerler: EMA'dan gecmeden, o karenin kendi olcumu
         out.raw_dx      = gdxdy[0];

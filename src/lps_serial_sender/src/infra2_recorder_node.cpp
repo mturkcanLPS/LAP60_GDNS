@@ -66,6 +66,9 @@ public:
         // OFA donanimi infra1 akisiyla paylasiliyor: infra1 '[OPTICFLOW] Hz'
         // duserse bu akis kapatilip (flow_enabled:=false) sadece tag kaydi alinabilir.
         flow_enabled_ = declare_parameter<bool>("flow_enabled", true);
+        // 17_11: gyroflow girdisi. "raw" = RANSAC'li, EMA'siz (z = o karenin kalitesi, RANSAC
+        // model bulamazsa 0); "all" = tum hucrelerin duz ortalamasi (OKAD ilk surum).
+        gyroflow_input_raw_ = declare_parameter<std::string>("gyroflow_input", "raw") != "all";
         // Akis sonucu buradan yayinlanir -> serial_sender opticflow2'ye koyar.
         flow_topic_ = declare_parameter<std::string>("flow_topic", "/infra2/optical_flow");
         // 19_11 gyroflow: serial_sender OF2'yi infra2'nin FILTRESIZ akisindan hesaplar
@@ -246,9 +249,11 @@ private:
             m.vector.y = r.dy;
             m.vector.z = r.quality;
             flow_pub_->publish(m);
-            // Filtresiz akis (gyroflow girdisi): x = all_dx, y = all_dy [px/kare], z = quality.
-            m.vector.x = r.all_dx;
-            m.vector.y = r.all_dy;
+            // Gyroflow girdisi (EMA'siz). raw: RANSAC'li, z = o karenin kalitesi (model yoksa 0).
+            // all: tum hucrelerin duz ortalamasi, z = EMA'li quality.
+            m.vector.x = gyroflow_input_raw_ ? r.raw_dx : r.all_dx;
+            m.vector.y = gyroflow_input_raw_ ? r.raw_dy : r.all_dy;
+            if (gyroflow_input_raw_) m.vector.z = r.raw_ok ? r.raw_quality : 0;
             flow_raw_pub_->publish(m);
         }
     }
@@ -294,6 +299,7 @@ private:
     std::string flow_raw_topic_;
     float node_size_ = 0.25f;
     bool  flow_enabled_ = true;
+    bool  gyroflow_input_raw_ = true;
 
     rclcpp::Subscription<isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>::SharedPtr tag_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
