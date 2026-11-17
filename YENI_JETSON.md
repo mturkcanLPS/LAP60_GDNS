@@ -13,7 +13,7 @@ Durum: 2026-11-07, L4T 36.4.7 üzerindeki çalışan Jetson incelenerek yazıld�
 1. Kullanıcı adı `lapis`, repo `/home/lapis/ros2_ws` olmalı. Yollar buna sabit.
 2. Servis **root** olarak ve **drop-in'leriyle birlikte** kurulmalı (README adım 6). Saat yükseltme, gerçek zamanlı öncelik ve radar reset pini root ister, drop-in'ler olmadan devreye girmez.
 3. Güç modu MAXN_SUPER olmalı (`sudo nvpmodel -m 2`).
-4. Radar adaptörü FTDI FT232R (19_11'den beri): sürücüsü JetPack'te hazır, `/dev/ttyFTDI` (udev kuralı FTDI gecikmesini 1 ms yapar). Eski CH340 kullanılırsa sürücüsü kernel sürümüne özeldir ve elle derlenir.
+4. Radar adaptörü CH340 (`/dev/ttyCH340`). Sürücüsü JetPack'te yok, kernel sürümüne özeldir ve elle derlenir (`install_ch341.sh`); kernel değişirse yeniden derlenir. (FTDI/CP2102 denendi, hat hatası verdi.)
 5. Eski `GDNS.service`'i **kurma ve açma**. Aşağıda neden.
 
 ## Repo'nun kendisinin yaptığı sistem ayarları
@@ -39,8 +39,8 @@ Yeni Jetson'da bunlar **yok**, elle yapılmalı. Komutlar README'de.
 | Ne | Durum (eski Jetson) | Yeni Jetson'da |
 |---|---|---|
 | Güç modu | `MAXN_SUPER` (mod 2) | `sudo nvpmodel -m 2` (kalıcıdır) |
-| CH340 sürücüsü (`ch341.ko`) | Elle derlenip kurulmuş (eski adaptör) | Radar FTDI/CP2102 ile bağlıysa gerekmez. CH340 kullanılacaksa `src/lps_bringup/drivers/ch341/install_ch341.sh`; kernel değişince tekrar. |
-| udev kuralı `/dev/ttyFTDI` (+ `/dev/ttyCP210x`, `/dev/ttyCH340`) | `/etc/udev/rules.d/99-usb-serial.rules` | README adım 5 |
+| CH340 sürücüsü (`ch341.ko`) | Elle derlenip kurulmuş | `src/lps_bringup/drivers/ch341/install_ch341.sh`. **Kernel değişince (`uname -r`) tekrar.** |
+| udev kuralı `/dev/ttyCH340` (+ `/dev/ttyFTDI`, `/dev/ttyCP210x`) | `/etc/udev/rules.d/99-usb-serial.rules` | README adım 5 |
 | Kullanıcı grupları | `lapis`: `dialout video gpio i2c render plugdev` | Servis root olduğu için şart değil. Yığını elle `lapis` ile çalıştıracaksan: `sudo usermod -aG dialout,video,gpio,i2c,render,plugdev lapis` |
 | RealSense sürümü sabit | `apt-mark hold` (2.57.7 / 4.57.7) | Tavsiye, README "Tavsiyeler" |
 | Otomatik güncelleme kapalı | packagekit, apt-daily, fwupd maskeli | Tavsiye: `scripts/otomatik_guncelleme_kapat.sh` |
@@ -87,7 +87,7 @@ Kamera, huni ya da IR LED yerleşimi eski drone'dan farklıysa kamera→platform
 
 ```bash
 nvpmodel -q | head -1                                   # NV Power Mode: MAXN_SUPER
-ls -l /dev/ttyFTDI                                      # radar portu var (FTDI + udev)
+ls -l /dev/ttyCH340                                     # radar portu var (CH340 + udev)
 systemctl is-enabled apriltag_bringup                   # enabled
 ls /etc/systemd/system/apriltag_bringup.service.d/      # clocks.conf dds_yerel.conf robust.conf
 cat /sys/class/devfreq/15a50000.ofa/governor            # performance (servis açıldıktan sonra)

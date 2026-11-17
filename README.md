@@ -17,14 +17,14 @@ Her şey tek bir systemd servisiyle (`apriltag_bringup`) açılışta başlar.
 | CUDA / DeepStream / VPI / OpenCV | 12.6 / 7.1 / 3.2 / 4.8 (JetPack'ten) |
 | ROS 2 | Humble (`ros-humble-desktop`) |
 | ROS paketleri (apt) | `ros-humble-realsense2-camera` 4.57.7 (+ `ros-humble-librealsense2` 2.57.7; test edilen sürüm, bkz. Tavsiyeler), `ros-humble-isaac-ros-apriltag` (+ `-interfaces`, `-image-proc`) 3.1.0 |
-| Kütüphaneler (apt) | `libapriltag-dev` 3.2, `libopencv-dev`, `nvidia-l4t-kernel-headers` (sadece eski CH340 adaptörü için), `python3-colcon-common-extensions` |
+| Kütüphaneler (apt) | `libapriltag-dev` 3.2, `libopencv-dev`, `nvidia-l4t-kernel-headers` (CH340 sürücüsü için), `python3-colcon-common-extensions` |
 
 Bağlantılar:
 
 | Ne | Port |
 |---|---|
 | Otopilot | `/dev/ttyTHS1`, 115200 baud |
-| HRVS radar | FTDI FT232R USB-seri (19_11'den beri) → `/dev/ttyFTDI` (udev kuralı, gecikme 1 ms), 921600 baud. Sürücüsü (`ftdi_sio`) JetPack'te hazır. Port `hrvs_port` ayarı; CP2102 için `/dev/ttyCP210x`, eski CH340 için `/dev/ttyCH340` (sürücüsü elle derlenir, adım 4). |
+| HRVS radar | CH340 USB-seri → `/dev/ttyCH340` (udev kuralı), 921600 baud. **Stok JetPack'te CH340 sürücüsü yok**, kurulumda derlenir (adım 4). Port `hrvs_port` ayarı. FTDI (`/dev/ttyFTDI`) ve CP2102 (`/dev/ttyCP210x`) denendi (18–19_11): aynı kabloda hat hataları oldu, radar ölçüm vermedi; udev kuralları duruyor. |
 | HRVS reset/tetik | GPIO PH.07 (gpiochip0, hat 50) |
 | RealSense | USB 3 |
 
@@ -83,8 +83,8 @@ src/car_detector/scripts/install_models.sh
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 
-# 4) (Sadece eski CH340 adaptörüyle) CH340 sürücüsü (ch341.ko): NVIDIA kernel'inde kapalı.
-#    Radar FTDI ya da CP2102 ile bağlıysa bu adım atlanır (sürücüleri JetPack'te hazır).
+# 4) CH340 sürücüsü (ch341.ko): NVIDIA kernel'inde kapalı, olmazsa radar portu oluşmaz.
+#    (Radar FTDI ya da CP2102 ile bağlansaydı gerekmezdi; onların sürücüleri JetPack'te hazır.)
 #    Kernel header'larıyla derler, sudo ile kurar. Zaten kuruluysa dokunmaz.
 src/lps_bringup/drivers/ch341/install_ch341.sh
 
@@ -110,7 +110,7 @@ for t in test_tag_fusion test_ir_triangle test_autopilot_rx test_dual_fusion; do
 
 # Servis logu: aşağıdakiler görünmeli
 journalctl -u apriltag_bringup -f
-#   [HRVS] frame=... alt=...            radar ölçüyor (port var mı: ls -l /dev/ttyFTDI)
+#   [HRVS] frame=... alt=...            radar ölçüyor (port var mı: ls -l /dev/ttyCH340)
 #   [GYROFLOW] OF1 tamam ... OF2 tamam ...   optik akış gyro ile temizleniyor
 #   [APRILTAG] ... Hz                   iki IR kamera geliyor
 #   cpu_apriltag ... max_hamming=1 min_margin=30
@@ -118,7 +118,7 @@ journalctl -u apriltag_bringup -f
 #   [SERIAL-RX] EKF yuksekligi ... m    otopilot 0x4A gönderiyorsa
 ```
 
-**JetPack/kernel güncellemesi:** (Sadece CH340 kullanılıyorsa) Kernel sürümü (`uname -r`) değişirse CH340 sürücüsü yeni sürümde olmaz ve radar gelmez. Güncellemeden sonra `install_ch341.sh` tekrar çalıştırılır. 36.4.x içindeki güncellemelerde sürüm aynı kaldığı için sürücü korunur.
+**JetPack/kernel güncellemesi:** Kernel sürümü (`uname -r`) değişirse CH340 sürücüsü yeni sürümde olmaz ve radar gelmez. Güncellemeden sonra `install_ch341.sh` tekrar çalıştırılır. 36.4.x içindeki güncellemelerde sürüm aynı kaldığı için sürücü korunur.
 
 **İlk açılış:** Seçili modelin TensorRT motoru oluşturulurken (~6 dk) araç tespiti çalışmaz. Diğer her şey çalışır. Motor model klasörüne yazılır, sonraki açılışlarda 1 sn'de yüklenir. Motorlar TensorRT sürümüne ve GPU'ya özel olduğu için repoda yoktur.
 
@@ -261,7 +261,7 @@ Kod aynı kalır ama şunlar **mekanik yerleşime bağlı**; kamera, huni ya da 
 | `cam_offset_infra1` / `cam_offset_infra2` | `serial_sender_node.cpp` varsayılanı (32.962/45 ve −17.962/45 mm); launch'ta serial_sender parametresi olarak ezilebilir | Kameradan platform merkezine ofset (kamera ekseninde, m) |
 | Huni tag ofsetleri | `tag_fusion.hpp` `funnelTagMeta()` | Duvar ve küçük tag konumları |
 | LED üçgeni + merkez | launch: `ir_leg_a_m`, `ir_leg_b_m`, `ir_center_on_short_m`, `ir_center_on_long_m` | LED'ler arası ve merkeze mesafeler |
-| Seri port / radar | launch `serial_port`, `hrvs_port`, udev kuralı | Otopilot ve radar (FTDI) bağlantısı |
+| Seri port / radar | launch `serial_port`, `hrvs_port`, udev kuralı | Otopilot ve radar (CH340) bağlantısı |
 
 Kamera intrinsics'i RealSense `camera_info`'dan otomatik gelir; elle girilmez.
 

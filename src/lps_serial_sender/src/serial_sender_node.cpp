@@ -100,10 +100,11 @@
 using namespace hrvs_sdk;
 
 // --- HRVS constants ---
-// Radar USB-seri adaptoru: CH340 -> CP2102 (18_11, klonu 921600'de veri bozdu) -> FTDI FT232R
-// (19_11, 0403:6001). Port 'hrvs_port' parametresi; varsayilan udev'in FTDI icin verdigi
-// /dev/ttyFTDI. ftdi_sio surucusu JetPack kernel'inde HAZIR. udev ayrica FTDI latency_timer'i 1 ms yapar.
-static constexpr char     HRVS_UART_PORT_DEFAULT[] = "/dev/ttyFTDI";
+// Radar USB-seri adaptoru: 'hrvs_port' parametresi. CH340 (varsayilan) -> CP2102 (18_11) -> FTDI
+// (19_11) denendi; CP2102 ve FTDI ile hatta break/frame/overrun hatalari oldu, radar olcum vermedi.
+// 17_11 tekrar CH340: 0 hata, 4 radar. CH340 surucusu (ch341.ko) JetPack'te YOK, elle derlenir
+// (install_ch341.sh). Diger adaptorler icin udev: /dev/ttyFTDI, /dev/ttyCP210x.
+static constexpr char     HRVS_UART_PORT_DEFAULT[] = "/dev/ttyCH340";
 static constexpr int      HRVS_UART_BAUDRATE  = 921600;
 static constexpr unsigned HRVS_RADARS_NUMBER  = 4;
 static constexpr unsigned HRVS_GPIO_PIN_ID    = 398;
@@ -2257,7 +2258,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ekf_alt_pub_;   // otopilot 0x4A (RX thread)
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr heading_pub_;   // 0x4A basliklari
-    std::string hrvs_port_ = HRVS_UART_PORT_DEFAULT;   // radar UART (FTDI FT232R)
+    std::string hrvs_port_ = HRVS_UART_PORT_DEFAULT;   // radar UART (CH340)
     bool             imu_enable_ = false;
     // 19_11 gyroflow (OF1 = infra1, OF2 = infra2; ayni IMU)
     bool             gyroflow_en_ = true, flow_fusion_ = false;

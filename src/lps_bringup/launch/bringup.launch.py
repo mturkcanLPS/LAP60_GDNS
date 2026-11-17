@@ -551,8 +551,10 @@ def generate_launch_description():
             'ir_csv':        True,
             # 12_11: otopilot RX kaydi (rx_sNNNN.csv): her 0x4A + saniyelik ozet. ~10 satir/s.
             'rx_csv':        True,
-            # 19_11: HRVS radar adaptoru FTDI FT232R (udev -> /dev/ttyFTDI, latency 1 ms), 921600 baud.
-            'hrvs_port':     '/dev/ttyFTDI',
+            # 17_11: HRVS radar adaptoru tekrar CH340 (/dev/ttyCH340), 921600 baud. FTDI ve CP2102
+            # ile ayni kabloda hat hatalari (break/frame/overrun) vardi, radar olcum vermedi; CH340 ile
+            # 30 s'de 0 hata, 4 radar. FTDI: '/dev/ttyFTDI', CP2102: '/dev/ttyCP210x'.
+            'hrvs_port':     '/dev/ttyCH340',
         }],
     )
 
