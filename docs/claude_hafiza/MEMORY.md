@@ -1,0 +1,18 @@
+- [HER ZAMAN Türkçe](always-turkish.md) — ara notlar ve özetler dahil; İngilizce'ye kayma defalarca düzeltildi
+- [Otopilot frame ve eğimden sorumlu](autopilot-owns-frame-and-tilt.md) — Jetson kamera optik frame'inde gönderir, gövde dönüşümü/eğim düzeltmesi bizim işimiz değil
+- [infra2 kamera](infra2-test-recording.md) — aprtiltag2/opticflow2 pakette; ~5 cm baseline farkı normal; OFA/VIC saat ayarı şart
+- [Araç tespiti bearing](car-detection-bearing.md) — car_detector (YOLOv8n VisDrone, varsayılan 736×1280 giriş, car_model arg) → paketin sonunda car alanı, paket 133 B; ölçümler ve export tuzakları
+- [IR üçgen markerı](ir-triangle-marker.md) — 1.36 m ikizkenar dik üçgen, konum hipotenüs ortasından, ölçek üçgenden (radardan değil)
+- [car_detector OOM çökmesi](car-detector-oom-crash.md) — 19_10: GPU hatası → sınırsız appsrc → OOM → tüm yığın havada ~100 s düştü; adli log yöntemi
+- [DDS host_id / SHM yarışı](dds-hostid-shm-race.md) — node'lar farklı IP setiyle açılırsa SHM kapanır, kareler UDP'de kaybolur; çözüm PrivateNetwork=yes (dds_yerel.conf)
+- [Sistem sağlığı + termal kapanma](jetson-health-thermal.md) — sağlık ayrı mesaj 0x48 (31 B, 1 Hz), ana paket 133 B; 20_10 fan dönmeyen açılışlarda 104 °C kapanma
+- [L4T 36.4.7 yarım güncelleme](l4t-3647-interrupted-update.md) — 22_10 GNOME offline update/packagekit öldü; 01_11 onarıldı (UEFI 36.4.7, ESP küçük→elle capsule), otomatik güncelleme tamamen kapalı (faz3), RealSense hold; SSD 456 güvensiz kapanma
+- [CH340 sürücüsü JetPack'te yok](ch340-driver-not-in-jetpack.md) — L4T'de CONFIG_USB_SERIAL_CH341 kapalı; ch341.ko elle derlenmiş, repoda install_ch341.sh; kernel sürümü değişirse radar gelmez
+- [Uçuş doğrulaması 03_11 / #74](post-flight-checks-pending.md) — FUSION eşli %92, boy filtresi + /hrvs/altitude çalışıyor, IR sahte 0, HRVS temiz; KAPAT'ta güç ~1 s'de kesildi (kapanış ~20 s sürüyor)
+- [GitHub repo LAP60_GDNS](github-repo-lap60-gdns.md) — ros2_ws = git repo, push deploy key ile; HRVS SDK ve modeller repoda, motorlar değil
+- [Gyroflow OF1/OF2 + FTDI 19_11](gyroflow-of.md) — OF1=infra1, OF2=infra2 gyro telafili, varsayılan açık; otopilot V1.1.3 bilmiyor → GPS'li modda uç; radar FTDI denendi→hat hatası; 17_11 tekrar CH340 (0 hata)
+- [Huni ofseti + başlık 15_11](funnel-offset-heading.md) — car bearing'e y +1.45 m ofset, 0x4A 19 B (dron/araç başlığı) ile döndürme; overlay'siz EO + IMU/ham akış CSV (841737c)
+- [HRVS kalkışta kopuyor 08_11](hrvs-takeoff-dropout.md) — 5/5 kalkışta radar susuyor, havada reset cevapsız (donanım); EKF ~11 m'de kesik; rx CSV + car_detector 120 s karar koruma (cb0d37b)
+- [HRVS açılış takılması](hrvs-startup-hang.md) — restart sonrası hrvsConfiguration sonsuz bekliyordu; PH.07 500 ms reset darbesi + steady_clock + bekçi ile düzeltildi; SDK debug logu (radar sıcaklıkları) varsayılan açık (20_10)
+- [Yeni Jetson kurulum dokümanı](new-jetson-setup-doc.md) — YENI_JETSON.md + README (07_11); sistem ayarı değişirse oraya da yaz; eski GDNS.service taşınmamalı
+- [Huni tag kalibrasyonu 05_11](funnel-tag-calibration.md) — referans = küçük tag plakası; duvar (0,.3004,-.0959) 26 cm; küçük 10/12/14/16 65 mm x ±4.5, y +7.54/−6.46 cm z=0 (canlı doğrulandı; 10/16 nadir, kablo); 25h9 sahte tespit filtresi; canlı kalibrasyon tuzakları

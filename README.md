@@ -30,6 +30,8 @@ Bağlantılar:
 
 > **Yollar `/home/lapis`'e sabit.** Servis dosyası, launch (model ve kayıt klasörleri) ve nvinfer config bu yolu kullanıyor. Kullanıcı `lapis` olmalı ve repo `/home/lapis/ros2_ws`'e klonlanmalı.
 
+> **Geliştirme geçmişi ve devam notu:** [docs/DEVAM_NOTU.md](docs/DEVAM_NOTU.md) — Claude ile yürütülen çalışmanın sohbet kaydı, hafıza notları, analiz betikleri ve açık işler.
+
 ## Kurulum (yeni Jetson)
 
 > Kurmadan önce **[YENI_JETSON.md](YENI_JETSON.md)**'yi oku: repo'nun kendisinin yaptığı sistem ayarları (saat yükseltme, DDS tamponu, öncelikler), eski Jetson'da elle yapılmış ayarlar, yapılmaması gerekenler ve bilinen sorunlar.
