@@ -10,7 +10,7 @@
 - [CH340 sürücüsü JetPack'te yok](ch340-driver-not-in-jetpack.md) — L4T'de CONFIG_USB_SERIAL_CH341 kapalı; ch341.ko elle derlenmiş, repoda install_ch341.sh; kernel sürümü değişirse radar gelmez
 - [Uçuş doğrulaması 03_11 / #74](post-flight-checks-pending.md) — FUSION eşli %92, boy filtresi + /hrvs/altitude çalışıyor, IR sahte 0, HRVS temiz; KAPAT'ta güç ~1 s'de kesildi (kapanış ~20 s sürüyor)
 - [GitHub repo LAP60_GDNS](github-repo-lap60-gdns.md) — ros2_ws = git repo, push deploy key ile; HRVS SDK ve modeller repoda, motorlar değil
-- [Gyroflow OF1/OF2 + FTDI 19_11](gyroflow-of.md) — OF1=infra1, OF2=infra2 gyro telafili, varsayılan açık; otopilot V1.1.3 bilmiyor → GPS'li modda uç; radar FTDI denendi→hat hatası; 17_11 tekrar CH340 (0 hata)
+- [Gyroflow OF1/OF2 19_11](gyroflow-of.md) — OF1=infra1, OF2=infra2 gyro telafili, varsayılan açık; otopilot V1.1.3 bilmiyor → GPS modu; 17_11 NTP saat adımı gyroflow tamponunu donduruyordu (düzeltildi, test_gyroflow); radar CH340
 - [Huni ofseti + başlık 15_11](funnel-offset-heading.md) — car bearing'e y +1.45 m ofset, 0x4A 19 B (dron/araç başlığı) ile döndürme; overlay'siz EO + IMU/ham akış CSV (841737c)
 - [HRVS kalkışta kopuyor 08_11](hrvs-takeoff-dropout.md) — 5/5 kalkışta radar susuyor, havada reset cevapsız (donanım); EKF ~11 m'de kesik; rx CSV + car_detector 120 s karar koruma (cb0d37b)
 - [HRVS açılış takılması](hrvs-startup-hang.md) — restart sonrası hrvsConfiguration sonsuz bekliyordu; PH.07 500 ms reset darbesi + steady_clock + bekçi ile düzeltildi; SDK debug logu (radar sıcaklıkları) varsayılan açık (20_10)

@@ -122,6 +122,11 @@ add_executable(test_tag_gate test/test_tag_gate.cpp)
 target_include_directories(test_tag_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 install(TARGETS test_tag_gate DESTINATION lib/${PROJECT_NAME})
 
+# Gyroflow saat sicramasi testi (17_11). Calistirma: ros2 run lps_serial_sender test_gyroflow
+add_executable(test_gyroflow test/test_gyroflow.cpp)
+target_include_directories(test_gyroflow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+install(TARGETS test_gyroflow DESTINATION lib/${PROJECT_NAME})
+
 # --- infra1 + infra2 birlesimi testi (dual_camera_fusion.hpp; donanimsiz) ---
 # Calistirma: ros2 run lps_serial_sender test_dual_fusion
 add_executable(test_dual_fusion test/test_dual_fusion.cpp)

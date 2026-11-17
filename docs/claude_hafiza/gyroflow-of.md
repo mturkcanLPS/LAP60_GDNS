@@ -1,6 +1,6 @@
 ---
 name: gyroflow-of
-description: "19_11 OKAD gyroflow entegre edildi — OF1 = infra1, OF2 = infra2 (akış birleşimi kapalı), filtresiz akış − gyro, varsayılan açık; otopilot V1.1.3 bilmiyor → GPS'li modda uç; FTDI radar + hat hataları (commit bekliyor)"
+description: "OKAD gyroflow OF1=infra1 OF2=infra2, varsayılan açık; otopilot V1.1.3 bilmiyor → GPS modu; 17_11 NTP saat adımı tamponu donduruyordu → gyroEkle sıfırlama düzeltmesi + test"
 metadata:
   node_type: memory
   type: project
@@ -19,3 +19,6 @@ metadata:
 İlgili: [[hrvs-takeoff-dropout]] [[funnel-offset-heading]] [[autopilot-owns-frame-and-tilt]]
 
 **17_11: radar tekrar CH340.** Aynı kabloyla CH340: 30 s'de 0 hata, 0 reset, 4 radar (72–73 mesaj), ölçüm akıyor → FTDI/CP2102 sorunu adaptör bağlantısındaydı (GND/seviye) ya da adaptörün kendisinde. `hrvs_port` varsayılan + launch `/dev/ttyCH340`. CH340 sürücüsü TIOCGICOUNT desteklemiyor (sayac.py çalışmaz).
+
+**17_11 HATA + DÜZELTME (commit bekliyor):** Jetson RTC zamanı tutmuyor → her açılışta timesyncd saati son kayıttan yüklüyor; internet varsa NTP ~20 s sonra saati dakikalarca ileri alıyor (s0205 +68 dk, s0206 +97 dk). RealSense global zamanı yakınsarken tek bir IMU örneği çok ileri damga alıyor; OKAD `gyroEkle`'deki `if (t <= s.t) return;` sonraki tüm örnekleri atıyor → tampon donuyor → OF1/OF2 kalıcı GyroYok, paket değeri DONUK kalıyor (canlıda dx/dy saniyelerce aynı). Ayrıca ileri sıçrayan örnekle ara değer → sessizce yanlış comp. Düzeltme: `gyroflow.hpp` gyroEkle başında |t − son| > tampon (2 s) ise q_.clear() (LPS işaretli). `test/test_gyroflow.cpp` (eski kodda 2 HATA, yenide geçiyor). Sahada internet yoksa adım olmaz ama saat yanlış kalır. OKAD'a bildirilmeli (dosya onların).
+**17_11 kullanıcı kararı:** gyroflow Tamam değilse pakete YENİ timestamp ile dx=dy=0, quality=0 gidiyor (`gyroflow_invalid_q0`, varsayılan true). OKAD dokümanı "paket güncellenmez" diyordu → bilinçli sapma, OKAD'a söylenmeli. false → eski davranış.

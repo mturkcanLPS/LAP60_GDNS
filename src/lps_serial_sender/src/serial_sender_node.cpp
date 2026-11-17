@@ -806,6 +806,10 @@ public:
         // UYARI: otopilot V1.1.3 bu formati bilmiyor -> otopilot guncellenene kadar GPS'li modda uc.
         gyroflow_en_ = has_parameter("gyroflow_enable") ? get_parameter("gyroflow_enable").as_bool()
                                                          : declare_parameter<bool>("gyroflow_enable", true);
+        // 17_11: gyroflow Tamam degilse (GyroYok / KareAraligi / gyro gec) paket YENI timestamp ile
+        // dx=dy=0, quality=0 gonderilir -> otopilot "olcum yok"u acikca gorur. false -> OKAD dokumanindaki
+        // eski davranis (paket guncellenmez, eski deger eski timestamp ile kalir).
+        gf_invalid_q0_ = declare_parameter<bool>("gyroflow_invalid_q0", true);
         infra2_flow_raw_topic_ = declare_parameter<std::string>("infra2_flow_raw_topic", "/infra2/optical_flow_raw");
         // Akis birlesimi (infra1+infra2 ortalamasi -> opticflow). Gyroflow ile KAPALI: OF1/OF2 ayri gider.
         flow_fusion_ = declare_parameter<bool>("flow_fusion", !gyroflow_en_);
@@ -1057,12 +1061,13 @@ private:
             flow2_csv_ << b;
             if (++flow2_lines_ % 15 == 0) flow2_csv_.flush();
         }
-        if (d != GyroFlowDurum::Tamam) return;   // paket guncellenmez (eski timestamp)
+        const bool ok = d == GyroFlowDurum::Tamam;
+        if (!ok && !gf_invalid_q0_) return;   // paket guncellenmez (eski timestamp)
         opticFlowPack_t of{};
         of.timestamp   = msSinceStart();
-        of.motionPos.x = gs.comp_dx_kare;
-        of.motionPos.y = gs.comp_dy_kare;
-        of.quality     = q;
+        of.motionPos.x = ok ? gs.comp_dx_kare : 0.f;   // gecersiz -> 0/0, quality 0 (yeni timestamp)
+        of.motionPos.y = ok ? gs.comp_dy_kare : 0.f;
+        of.quality     = ok ? q : 0;
         std::lock_guard<std::mutex> lk(data_mutex_);
         opticflow2_ = of;
     }
@@ -1451,6 +1456,7 @@ private:
                 gd = (int)d; gfCount(1, d);
                 of_ok = d == GyroFlowDurum::Tamam;
                 if (of_ok) { of.motionPos.x = gs.comp_dx_kare; of.motionPos.y = gs.comp_dy_kare; }
+                else if (gf_invalid_q0_) { of.motionPos.x = 0.f; of.motionPos.y = 0.f; of.quality = 0; }
             }
 
             // Ham akis CSV'si - EMA ONCESI kare-basi olcum (aciksa).
@@ -1474,8 +1480,8 @@ private:
                 if (++csv_lines_ % 15 == 0) flow_csv_.flush();
             }
 
-            // Gyroflow gecersizse (GyroYok / KareAraligi) paket guncellenmez: eski timestamp ile kalir.
-            if (of_ok) { std::lock_guard<std::mutex> lk(data_mutex_); opticflow_ = of; }
+            // Gyroflow gecersizse: gyroflow_invalid_q0 -> 0/0/q0 yeni timestamp; degilse paket guncellenmez.
+            if (of_ok || gf_invalid_q0_) { std::lock_guard<std::mutex> lk(data_mutex_); opticflow_ = of; }
         }
     }
 
@@ -2261,7 +2267,7 @@ private:
     std::string hrvs_port_ = HRVS_UART_PORT_DEFAULT;   // radar UART (CH340)
     bool             imu_enable_ = false;
     // 19_11 gyroflow (OF1 = infra1, OF2 = infra2; ayni IMU)
-    bool             gyroflow_en_ = true, flow_fusion_ = false;
+    bool             gyroflow_en_ = true, flow_fusion_ = false, gf_invalid_q0_ = true;
     GyroFlow         gf1_, gf2_;
     double           gf_prev1_ = 0.0;   // VPI thread'i
     double           gf_prev2_ = 0.0;   // executor

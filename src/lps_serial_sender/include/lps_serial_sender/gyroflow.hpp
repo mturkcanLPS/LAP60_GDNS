@@ -1,5 +1,6 @@
 // gyroflow.hpp - RealSense optic flow donme telafisi (gyroflow), tek basliklik C++17
-// Kaynak: OKAD_Analiz/RealSense_Gyroflow/jetson/gyroflow.hpp (OKAD, 2026-11-16), degistirilmeden alindi.
+// Kaynak: OKAD_Analiz/RealSense_Gyroflow/jetson/gyroflow.hpp (OKAD, 2026-11-16).
+// LPS degisikligi (17_11): gyroEkle'de tampondan buyuk zaman sicramasinda tampon sifirlanir (asagida isaretli).
 // Entegrasyon notu: OKAD_Jetson_Gyroflow.md. serial_sender'da kamera basina bir nesne (gf1 infra1,
 // gf2 infra2); infra1 ve infra2 ayni D435i'nin iki gozu oldugu icin ikisi de AYNI IMU ile beslenir.
 //
@@ -53,6 +54,10 @@ public:
     // RealSense gyro ornegi: t [s], gx gy [rad/s] (kamera/IMU ekseni, ham; gz kullanilmaz)
     void gyroEkle(double t, float gx, float gy) {
         std::lock_guard<std::mutex> k(m_);
+        // LPS 17_11: sistem saati adimi (NTP) RealSense global zamanini da sicratir. Ileri sicrayan tek bir
+        // ornek yuzunden sonraki tum ornekler "geri giden" sayilip atiliyor, tampon donuyor ve dakikalarca
+        // GyroYok donuyordu (s0205: +68 dk NTP adimi). Tampondan buyuk sicramada (ileri/geri) bastan baslar.
+        if (!q_.empty() && std::fabs(t - q_.back().t) > a_.tampon) q_.clear();
         if (!q_.empty()) {
             const Ornek& s = q_.back();
             if (t <= s.t) return;                       // geri giden / tekrar eden ornek
