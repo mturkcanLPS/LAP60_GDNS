@@ -68,6 +68,9 @@ public:
         flow_enabled_ = declare_parameter<bool>("flow_enabled", true);
         // Akis sonucu buradan yayinlanir -> serial_sender opticflow2'ye koyar.
         flow_topic_ = declare_parameter<std::string>("flow_topic", "/infra2/optical_flow");
+        // 19_11 gyroflow: serial_sender OF2'yi infra2'nin FILTRESIZ akisindan hesaplar
+        // (all_dx/all_dy: RANSAC'siz, EMA'siz ortalama) -> ayri topic, header.stamp = kare cekim ani.
+        flow_raw_topic_ = declare_parameter<std::string>("flow_raw_topic", "/infra2/optical_flow_raw");
         // infra1 ile ayni: akis kare-araligi duzenliligi (duzenli/atlanan %)
         gap_stats_ = std::make_unique<lps::FrameGapStats>(
             declare_parameter<double>("camera_fps", 30.0));
@@ -85,6 +88,8 @@ public:
         if (flow_enabled_) {
             flow_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
                 flow_topic_, rclcpp::SensorDataQoS());
+            flow_raw_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
+                flow_raw_topic_, rclcpp::SensorDataQoS());
             flow_ = std::make_unique<lps::OpticalFlowVPI>(grid, levels, ema, tex, pre);
             vpi_thread_ = std::thread(&Infra2RecorderNode::vpiThread, this);
         }
@@ -241,6 +246,10 @@ private:
             m.vector.y = r.dy;
             m.vector.z = r.quality;
             flow_pub_->publish(m);
+            // Filtresiz akis (gyroflow girdisi): x = all_dx, y = all_dy [px/kare], z = quality.
+            m.vector.x = r.all_dx;
+            m.vector.y = r.all_dy;
+            flow_raw_pub_->publish(m);
         }
     }
 
@@ -281,6 +290,8 @@ private:
 
     std::string image_topic_, tag_topic_, label_, flow_topic_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr flow_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr flow_raw_pub_;   // gyroflow girdisi
+    std::string flow_raw_topic_;
     float node_size_ = 0.25f;
     bool  flow_enabled_ = true;
 

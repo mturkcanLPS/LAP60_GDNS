@@ -42,7 +42,8 @@
 #include "lps_serial_sender/debug_recorder.hpp"   // ucus video kaydi (opsiyonel)
 #include "lps_serial_sender/ir_triangle.hpp"      // IR blob tespiti + ucgen eslesmesi
 #include "lps_serial_sender/tag_fusion.hpp"       // AprilTag -> avgPos (infra2 ile ORTAK)
-#include "lps_serial_sender/tag_gate.hpp"         // 08_11: kisa tag goruslerini otopilota gonderme
+#include "lps_serial_sender/tag_gate.hpp"
+#include "lps_serial_sender/gyroflow.hpp"         // 19_11: OKAD gyroflow (OF1/OF2 donme telafisi)         // 08_11: kisa tag goruslerini otopilota gonderme
 #include "lps_serial_sender/frame_gap_stats.hpp"  // akis kare araligi duzenliligi
 #include "lps_serial_sender/system_health.hpp"    // Jetson sicaklik/yuk/guc -> health alani
 #include "lps_serial_sender/autopilot_rx.hpp"     // otopilot -> Jetson mesajlari (0x49 KAPAT)
@@ -77,6 +78,8 @@
 #include <thread>
 #include <condition_variable>
 #include <atomic>
+#include <array>
+#include <deque>
 #include <map>          // funnel tag_meta
 #include <vector>       // funnel estimates
 #include <algorithm>    // std::nth_element (median outlier)
@@ -97,7 +100,10 @@
 using namespace hrvs_sdk;
 
 // --- HRVS constants ---
-static constexpr char     HRVS_UART_PORT[]    = "/dev/ttyCH340";
+// Radar USB-seri adaptoru: CH340 -> CP2102 (18_11, klonu 921600'de veri bozdu) -> FTDI FT232R
+// (19_11, 0403:6001). Port 'hrvs_port' parametresi; varsayilan udev'in FTDI icin verdigi
+// /dev/ttyFTDI. ftdi_sio surucusu JetPack kernel'inde HAZIR. udev ayrica FTDI latency_timer'i 1 ms yapar.
+static constexpr char     HRVS_UART_PORT_DEFAULT[] = "/dev/ttyFTDI";
 static constexpr int      HRVS_UART_BAUDRATE  = 921600;
 static constexpr unsigned HRVS_RADARS_NUMBER  = 4;
 static constexpr unsigned HRVS_GPIO_PIN_ID    = 398;
@@ -564,8 +570,10 @@ public:
         camera_info_topic_ = declare_parameter<std::string>(
             "camera_info_topic", "/camera/camera/infra1/camera_info");
 
-        if (ir_enabled_) {
-            ir_pts_.reserve(kIrMaxBlobs);
+        // camera_info: IR icin, ve 18_11'den beri akisin donme temizligi (odak uzakligi) icin.
+        if (ir_enabled_) ir_pts_.reserve(kIrMaxBlobs);
+        imu_enable_ = declare_parameter<bool>("imu_enable", false);
+        if (ir_enabled_ || imu_enable_) {
             cinfo_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
                 camera_info_topic_, rclcpp::SensorDataQoS(),
                 std::bind(&SerialSenderNode::cinfoCb, this, std::placeholders::_1));
@@ -599,12 +607,24 @@ public:
                 // 15_11: kam_t = kamera cekim ani (s, header.stamp) -> IMU ile eslestirme ve
                 // kare atlama (dt) icin. all_* = filtresiz ortalama, tex_* = dokulu hucre
                 // ortalamasi (ikisi de RANSAC'siz, EMA'siz). raw_* = RANSAC sonrasi, EMA oncesi.
+                // 19_11: comp_dx_kare/comp_dy_kare = gyroflow OF1 (pakete giden, px / nominal 1/30 s kare),
+                // durum: 0 Tamam, 1 GyroGelmedi, 2 GyroYok, 3 KareAraligi, -1 gyroflow kapali.
                 flow_csv_ << "t_ms,kam_t,all_dx,all_dy,tex_dx,tex_dy,tex_n,raw_dx,raw_dy,raw_q,"
-                             "ema_dx,ema_dy,ema_q,consist,tex,g50,g90\n";
+                             "ema_dx,ema_dy,ema_q,consist,tex,g50,g90,comp_dx_kare,comp_dy_kare,durum\n";
                 flow_csv_.flush();
                 RCLCPP_INFO(get_logger(), "Ham akis CSV: %s", path.c_str());
             } else {
                 RCLCPP_ERROR(get_logger(), "Akis CSV acilamadi: %s", path.c_str());
+            }
+            // 19_11: OF2 (infra2) gyroflow kaydi. all_dx/all_dy filtresiz girdi, comp_* pakete giden.
+            if (has_parameter("gyroflow_enable") ? get_parameter("gyroflow_enable").as_bool()
+                                                  : declare_parameter<bool>("gyroflow_enable", true)) {
+                const std::string p2 = lps::claimRecordPath(dir, "flow2", record_session_, "csv");
+                flow2_csv_.open(p2);
+                if (flow2_csv_) {
+                    flow2_csv_ << "t_ms,kam_t,all_dx,all_dy,q,comp_dx_kare,comp_dy_kare,durum\n";
+                    RCLCPP_INFO(get_logger(), "OF2 gyroflow CSV: %s", p2.c_str());
+                }
             }
         }
 
@@ -635,31 +655,27 @@ public:
         // unite_imu_method=2 -> tek /camera/camera/imu topic'i, gyro hizinda). Sadece CSV'ye
         // yazilir, pakete GITMEZ. Amac: akisi donmeden arindirma / titresim analizi.
         // stamp_s kamera kareleriyle AYNI saat (flow CSV'deki kam_t ile eslesir).
-        if (declare_parameter<bool>("imu_csv", false)) {
-            const std::string dir = has_parameter("record_dir")
-                ? get_parameter("record_dir").as_string()
-                : declare_parameter<std::string>("record_dir", "/home/lapis/lps_records");
-            const std::string path = lps::claimRecordPath(dir, "imu", record_session_, "csv");
-            imu_csv_.open(path);
-            if (imu_csv_) {
-                imu_csv_ << "t_ms,stamp_s,gx,gy,gz,ax,ay,az\n";   // rad/s, m/s^2, IMU optik cercevesi
-                imu_csv_.flush();
-                RCLCPP_INFO(get_logger(), "IMU CSV: %s", path.c_str());
-                imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-                    declare_parameter<std::string>("imu_topic", "/camera/camera/imu"),
-                    rclcpp::SensorDataQoS().keep_last(400),
-                    [this](const sensor_msgs::msg::Imu::SharedPtr m) {
-                        char line[160];
-                        std::snprintf(line, sizeof(line), "%u,%.6f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f\n",
-                            msSinceStart(), lps::stampSeconds(m->header.stamp),
-                            m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z,
-                            m->linear_acceleration.x, m->linear_acceleration.y, m->linear_acceleration.z);
-                        imu_csv_ << line;
-                        if (++imu_lines_ % 200 == 0) imu_csv_.flush();   // ~1 s'de bir
-                    });
-            } else {
-                RCLCPP_ERROR(get_logger(), "IMU CSV acilamadi: %s", path.c_str());
+        // RealSense IMU (imu_enable): 200 Hz ham IMU ayri dosyaya (imu_csv, imu_sNNNN.csv).
+        // 19_11: akis ve IMU yine AYRI dosyalarda (kullanici istegi).
+        if (imu_enable_) {
+            if (declare_parameter<bool>("imu_csv", true)) {
+                const std::string dir = has_parameter("record_dir")
+                    ? get_parameter("record_dir").as_string()
+                    : declare_parameter<std::string>("record_dir", "/home/lapis/lps_records");
+                const std::string path = lps::claimRecordPath(dir, "imu", record_session_, "csv");
+                imu_csv_.open(path);
+                if (imu_csv_) {
+                    imu_csv_ << "t_ms,stamp_s,gx,gy,gz,ax,ay,az\n";   // rad/s, m/s^2, IMU optik cercevesi
+                    imu_csv_.flush();
+                    RCLCPP_INFO(get_logger(), "IMU CSV: %s", path.c_str());
+                } else {
+                    RCLCPP_ERROR(get_logger(), "IMU CSV acilamadi: %s", path.c_str());
+                }
             }
+            imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+                declare_parameter<std::string>("imu_topic", "/camera/camera/imu"),
+                rclcpp::SensorDataQoS().keep_last(400),
+                [this](const sensor_msgs::msg::Imu::SharedPtr m) { onImu(m); });
         }
 
         // Otopilot -> Jetson RX kaydi (12_11): 148-151 ucuslarinda EKF yuksekligi ~11 m'de
@@ -783,6 +799,15 @@ public:
         // bu topic'ler sessiz kalir ve alanlar SIFIR gider (valid=0, Q=0, ts=0).
         infra2_tag_topic_  = declare_parameter<std::string>("infra2_tag_topic",  "/tag_detections_infra2");
         infra2_flow_topic_ = declare_parameter<std::string>("infra2_flow_topic", "/infra2/optical_flow");
+        // 19_11 OKAD gyroflow (gyroflow.hpp, OKAD_Jetson_Gyroflow.md): OF1 = infra1, OF2 = infra2;
+        // her biri FILTRESIZ akis (all_dx/all_dy) - RealSense gyro donmesi, EMA YOK. Iki nesne de
+        // ayni D435i IMU'su ile beslenir. Kapali -> eski davranis (EMA'li akis, akis birlesimi).
+        // UYARI: otopilot V1.1.3 bu formati bilmiyor -> otopilot guncellenene kadar GPS'li modda uc.
+        gyroflow_en_ = has_parameter("gyroflow_enable") ? get_parameter("gyroflow_enable").as_bool()
+                                                         : declare_parameter<bool>("gyroflow_enable", true);
+        infra2_flow_raw_topic_ = declare_parameter<std::string>("infra2_flow_raw_topic", "/infra2/optical_flow_raw");
+        // Akis birlesimi (infra1+infra2 ortalamasi -> opticflow). Gyroflow ile KAPALI: OF1/OF2 ayri gider.
+        flow_fusion_ = declare_parameter<bool>("flow_fusion", !gyroflow_en_);
 
         // Iki kamera birlesimi + platform merkezi ofseti (03_11, dual_camera_fusion.hpp).
         // Ofset = kameradan platform merkezine vektor, KAMERA ekseninde (x saga, y asagi), m.
@@ -823,6 +848,11 @@ public:
             isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray>(
             infra2_tag_topic_, rclcpp::SensorDataQoS(),
             std::bind(&SerialSenderNode::tagCb2, this, std::placeholders::_1));
+        if (gyroflow_en_)
+            flow2_raw_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
+                infra2_flow_raw_topic_, rclcpp::SensorDataQoS(),
+                std::bind(&SerialSenderNode::flowRawCb2, this, std::placeholders::_1));
+        else
         flow2_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
             infra2_flow_topic_, rclcpp::SensorDataQoS(),
             std::bind(&SerialSenderNode::flowCb2, this, std::placeholders::_1));
@@ -851,6 +881,7 @@ public:
         // TX0-2, PM, DIG0-1). Amac: ~25 dk sonra baslayan UART hatalari radar isinmasiyla
         // mi geliyor. SDK'da sicaklik getter'i yok, tek yol bu. Klasor oturuma ozel.
         hrvs_debug_log_ = declare_parameter<bool>("hrvs_debug_log", true);
+        hrvs_port_      = declare_parameter<std::string>("hrvs_port", HRVS_UART_PORT_DEFAULT);
 
         {
             const std::string dir = has_parameter("record_dir")
@@ -900,6 +931,7 @@ public:
 
         // CSV: VPI thread durduktan SONRA kapat (yazan o thread'di)
         if (flow_csv_.is_open()) flow_csv_.close();
+        if (flow2_csv_.is_open()) flow2_csv_.close();
         if (imu_csv_.is_open()) imu_csv_.close();
 
         // IR CSV: yazan imgCb (ROS callback) thread'iydi; buraya spin dondukten
@@ -990,6 +1022,58 @@ private:
     /* (infra1 ile ayni OpticalFlowVPI) hesaplanip Vector3Stamped ile  */
     /* gelir: x=dx, y=dy (px/kare, EMA'li), z=quality (0-100).          */
     /* -------------------------------------------------------------- */
+    /* 19_11 gyroflow OF2: infra2'nin filtresiz akisi (x = all_dx, y = all_dy, z = Q; stamp = kare).
+       IMU ayni executor'da: GyroGelmedi'de bekleyemeyiz -> kare bekletilir, IMU geri cagrisinda
+       tekrar denenir (en fazla 50 ms). */
+    void flowRawCb2(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
+    {
+        flow2_cb_count_++;
+        const double tK = lps::stampSeconds(msg->header.stamp);
+        const double tO = gf_prev2_;
+        gf_prev2_ = tK;
+        if (pend2_.active) processFlow2(pend2_.tK, pend2_.tO, pend2_.dx, pend2_.dy, pend2_.q, false, true);
+        processFlow2(tK, tO, (float)msg->vector.x, (float)msg->vector.y,
+                     (uint8_t)std::clamp(msg->vector.z, 0.0, 100.0), false);
+    }
+    void processFlow2(double tK, double tO, float dx, float dy, uint8_t q, bool from_imu, bool force = false)
+    {
+        GyroFlowSonuc gs;
+        GyroFlowDurum d = tO > 0.0 ? gf2_.hesapla(tK, tO, dx, dy, gs) : GyroFlowDurum::KareAraligi;
+        if (d == GyroFlowDurum::GyroGelmedi && !force) {
+            pend2_ = {true, tK, tO, dx, dy, q};
+            if (!from_imu) return;
+            if (lps::stampSeconds(now()) - tK < 0.05) return;   // IMU hala bekleniyor
+        }
+        pend2_.active = false;
+        gfCount(2, d);
+        if (flow2_csv_.is_open()) {
+            char b[160];
+            if (d == GyroFlowDurum::Tamam)
+                std::snprintf(b, sizeof(b), "%u,%.6f,%.4f,%.4f,%u,%.4f,%.4f,0\n", msSinceStart(), tK, dx, dy, q,
+                              gs.comp_dx_kare, gs.comp_dy_kare);
+            else
+                std::snprintf(b, sizeof(b), "%u,%.6f,%.4f,%.4f,%u,,,%d\n", msSinceStart(), tK, dx, dy, q, (int)d);
+            flow2_csv_ << b;
+            if (++flow2_lines_ % 15 == 0) flow2_csv_.flush();
+        }
+        if (d != GyroFlowDurum::Tamam) return;   // paket guncellenmez (eski timestamp)
+        opticFlowPack_t of{};
+        of.timestamp   = msSinceStart();
+        of.motionPos.x = gs.comp_dx_kare;
+        of.motionPos.y = gs.comp_dy_kare;
+        of.quality     = q;
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        opticflow2_ = of;
+    }
+    void gfCount(int cam, GyroFlowDurum d)
+    {
+        gf_cnt_[cam - 1][(int)d].fetch_add(1);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+            "[GYROFLOW] OF1 tamam %u gelmedi %u gyro-yok %u aralik %u | OF2 tamam %u gelmedi %u gyro-yok %u aralik %u",
+            gf_cnt_[0][0].load(), gf_cnt_[0][1].load(), gf_cnt_[0][2].load(), gf_cnt_[0][3].load(),
+            gf_cnt_[1][0].load(), gf_cnt_[1][1].load(), gf_cnt_[1][2].load(), gf_cnt_[1][3].load());
+    }
+
     void flowCb2(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
     {
         flow2_cb_count_++;
@@ -1346,9 +1430,27 @@ private:
 
             opticFlowPack_t of{};
             of.timestamp   = msSinceStart();
-            of.motionPos.x = r.dx;        // EMA'li - pakete giden
+            of.motionPos.x = r.dx;        // EMA'li (gyroflow kapaliysa pakete giden)
             of.motionPos.y = r.dy;
             of.quality     = r.quality;   // kapsama-cezali, EMA'li Q
+            // 19_11 gyroflow (OF1): filtresiz akis - gyro donmesi. GyroGelmedi -> kisa bekle, tekrar.
+            GyroFlowSonuc gs; int gd = -1;
+            bool of_ok = true;
+            if (gyroflow_en_) {
+                const double t_prev = gf_prev1_;
+                gf_prev1_ = stamp_s;
+                GyroFlowDurum d = GyroFlowDurum::KareAraligi;
+                if (t_prev > 0.0) {
+                    for (int k = 0; k < 10; ++k) {   // en fazla ~30 ms
+                        d = gf1_.hesapla(stamp_s, t_prev, r.all_dx, r.all_dy, gs);
+                        if (d != GyroFlowDurum::GyroGelmedi || !vpi_running_) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                    }
+                }
+                gd = (int)d; gfCount(1, d);
+                of_ok = d == GyroFlowDurum::Tamam;
+                if (of_ok) { of.motionPos.x = gs.comp_dx_kare; of.motionPos.y = gs.comp_dy_kare; }
+            }
 
             // Ham akis CSV'si - EMA ONCESI kare-basi olcum (aciksa).
             // Yarim saniyede bir flush: ani kesintide en fazla ~15 satir kayip.
@@ -1361,11 +1463,18 @@ private:
                           << (unsigned)r.raw_quality << ','
                           << r.dx << ',' << r.dy << ',' << (unsigned)r.quality << ','
                           << r.consist << ',' << r.tex_ratio << ','
-                          << (unsigned)r.tex_p50 << ',' << (unsigned)r.tex_p90 << '\n';
+                          << (unsigned)r.tex_p50 << ',' << (unsigned)r.tex_p90 << ',';
+                if (gd == 0) {
+                    char b[64]; std::snprintf(b, sizeof(b), "%.4f,%.4f,0\n", gs.comp_dx_kare, gs.comp_dy_kare);
+                    flow_csv_ << b;
+                } else {
+                    flow_csv_ << ",," << gd << '\n';
+                }
                 if (++csv_lines_ % 15 == 0) flow_csv_.flush();
             }
 
-            { std::lock_guard<std::mutex> lk(data_mutex_); opticflow_ = of; }
+            // Gyroflow gecersizse (GyroYok / KareAraligi) paket guncellenmez: eski timestamp ile kalir.
+            if (of_ok) { std::lock_guard<std::mutex> lk(data_mutex_); opticflow_ = of; }
         }
     }
 
@@ -1466,6 +1575,7 @@ private:
             ++fus_tag_cnt_[tr.src];
             if (tr.diff_m >= 0) { fus_tag_diff_sum_ += tr.diff_m; ++fus_tag_diff_n_; }
 
+            if (flow_fusion_) {
             const auto flowSample = [&fresh, this](const opticFlowPack_t &f) {
                 lps::FlowSample s;
                 s.ok = fresh(f.timestamp, flow_fresh_ms_);
@@ -1482,6 +1592,7 @@ private:
                 of_copy.quality     = fr.out.q;
             }
             ++fus_flow_cnt_[fr.src];
+            }
         }
 
         jetsonOtopilotPack_ut pkt;
@@ -1889,11 +2000,13 @@ private:
         RadarSystem  radarSystem(hrvs_debug_log_, hrvs_debug_log_ ? hrvs_debug_dir_.c_str() : nullptr);
         hrvsProgress();
 
-        auto uartRet = static_cast<UARTLinux::ReturnCode>(uart.initUART(HRVS_UART_PORT));
+        auto uartRet = static_cast<UARTLinux::ReturnCode>(uart.initUART(hrvs_port_.c_str()));
         if (uartRet != UARTLinux::ReturnCode::OK) {
-            RCLCPP_ERROR(get_logger(), "HRVS: UART init basarisiz (kod %u)", unsigned(uartRet));
+            RCLCPP_ERROR(get_logger(), "HRVS: UART init basarisiz (kod %u) port %s — adaptor takili mi, udev "
+                         "kurali yuklu mu (ls -l %s)?", unsigned(uartRet), hrvs_port_.c_str(), hrvs_port_.c_str());
             return;
         }
+        RCLCPP_INFO(get_logger(), "HRVS: port %s @ %d baud", hrvs_port_.c_str(), HRVS_UART_BAUDRATE);
         uartRet = static_cast<UARTLinux::ReturnCode>(
             uart.configureUART(HRVS_UART_BAUDRATE, IUART::Parity::NO,
                                IUART::StopBits::ONE, 8));
@@ -2144,7 +2257,37 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ekf_alt_pub_;   // otopilot 0x4A (RX thread)
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr heading_pub_;   // 0x4A basliklari
-    std::ofstream imu_csv_;   // RealSense IMU logu (sadece imu callback'i yazar)
+    std::string hrvs_port_ = HRVS_UART_PORT_DEFAULT;   // radar UART (FTDI FT232R)
+    bool             imu_enable_ = false;
+    // 19_11 gyroflow (OF1 = infra1, OF2 = infra2; ayni IMU)
+    bool             gyroflow_en_ = true, flow_fusion_ = false;
+    GyroFlow         gf1_, gf2_;
+    double           gf_prev1_ = 0.0;   // VPI thread'i
+    double           gf_prev2_ = 0.0;   // executor
+    struct Pend2 { bool active = false; double tK = 0, tO = 0; float dx = 0, dy = 0; uint8_t q = 0; } pend2_;
+    std::atomic<uint32_t> gf_cnt_[2][4] = {};
+    std::string      infra2_flow_raw_topic_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr flow2_raw_sub_;
+    std::ofstream    flow2_csv_;
+    uint32_t         flow2_lines_ = 0;
+    void onImu(const sensor_msgs::msg::Imu::SharedPtr &m)
+    {
+        const double t = lps::stampSeconds(m->header.stamp);
+        if (gyroflow_en_) {   // ayni IMU iki kameraya (infra1/infra2 ayni D435i)
+            gf1_.gyroEkle(t, (float)m->angular_velocity.x, (float)m->angular_velocity.y);
+            gf2_.gyroEkle(t, (float)m->angular_velocity.x, (float)m->angular_velocity.y);
+            if (pend2_.active) processFlow2(pend2_.tK, pend2_.tO, pend2_.dx, pend2_.dy, pend2_.q, true);
+        }
+        if (imu_csv_.is_open()) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "%u,%.6f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f\n",
+                msSinceStart(), t, m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z,
+                m->linear_acceleration.x, m->linear_acceleration.y, m->linear_acceleration.z);
+            imu_csv_ << line;
+            if (++imu_lines_ % 200 == 0) imu_csv_.flush();
+        }
+    }
+    std::ofstream imu_csv_;   // RealSense IMU 200 Hz ham logu (istege bagli; imu callback'i yazar)
     uint32_t imu_lines_ = 0;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     std::ofstream rx_csv_;   // otopilot RX kaydi (sadece RX thread'i yazar; dtor RX join'den sonra kapatir)

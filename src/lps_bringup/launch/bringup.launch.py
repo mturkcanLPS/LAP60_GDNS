@@ -542,6 +542,8 @@ def generate_launch_description():
             # 15_11: ham akis logu (flow_sNNNN.csv): filtresiz/dokulu ortalama, RANSAC sonrasi
             # ham, EMA'li ve kamera cekim zamani. ~30 satir/s.
             'flow_csv':     True,
+            # IMU (imu_log): 200 Hz ham IMU ayri dosyada (imu_sNNNN.csv), akis ayri (flow_sNNNN.csv).
+            'imu_enable':   ParameterValue(LaunchConfiguration('imu_log'), value_type=bool),
             'imu_csv':      ParameterValue(LaunchConfiguration('imu_log'), value_type=bool),
             # IR CSV logu — ucus sonrasi analiz. record_dir'e ir_YYYYmmdd...csv
             # duser, HER kare yazilir (tespit olmayan kareler esik ayari icin
@@ -549,6 +551,8 @@ def generate_launch_description():
             'ir_csv':        True,
             # 12_11: otopilot RX kaydi (rx_sNNNN.csv): her 0x4A + saniyelik ozet. ~10 satir/s.
             'rx_csv':        True,
+            # 19_11: HRVS radar adaptoru FTDI FT232R (udev -> /dev/ttyFTDI, latency 1 ms), 921600 baud.
+            'hrvs_port':     '/dev/ttyFTDI',
         }],
     )
 

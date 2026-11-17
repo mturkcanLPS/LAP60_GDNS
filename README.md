@@ -17,14 +17,14 @@ Her şey tek bir systemd servisiyle (`apriltag_bringup`) açılışta başlar.
 | CUDA / DeepStream / VPI / OpenCV | 12.6 / 7.1 / 3.2 / 4.8 (JetPack'ten) |
 | ROS 2 | Humble (`ros-humble-desktop`) |
 | ROS paketleri (apt) | `ros-humble-realsense2-camera` 4.57.7 (+ `ros-humble-librealsense2` 2.57.7; test edilen sürüm, bkz. Tavsiyeler), `ros-humble-isaac-ros-apriltag` (+ `-interfaces`, `-image-proc`) 3.1.0 |
-| Kütüphaneler (apt) | `libapriltag-dev` 3.2, `libopencv-dev`, `nvidia-l4t-kernel-headers` (CH340 sürücüsü için), `python3-colcon-common-extensions` |
+| Kütüphaneler (apt) | `libapriltag-dev` 3.2, `libopencv-dev`, `nvidia-l4t-kernel-headers` (sadece eski CH340 adaptörü için), `python3-colcon-common-extensions` |
 
 Bağlantılar:
 
 | Ne | Port |
 |---|---|
 | Otopilot | `/dev/ttyTHS1`, 115200 baud |
-| HRVS radar | CH340 USB-seri → `/dev/ttyCH340` (udev kuralı), 921600 baud. **Stok JetPack'te sürücüsü yok**, kurulumda derlenir. |
+| HRVS radar | FTDI FT232R USB-seri (19_11'den beri) → `/dev/ttyFTDI` (udev kuralı, gecikme 1 ms), 921600 baud. Sürücüsü (`ftdi_sio`) JetPack'te hazır. Port `hrvs_port` ayarı; CP2102 için `/dev/ttyCP210x`, eski CH340 için `/dev/ttyCH340` (sürücüsü elle derlenir, adım 4). |
 | HRVS reset/tetik | GPIO PH.07 (gpiochip0, hat 50) |
 | RealSense | USB 3 |
 
@@ -83,11 +83,12 @@ src/car_detector/scripts/install_models.sh
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 
-# 4) CH340 sürücüsü (ch341.ko): NVIDIA kernel'inde kapalı, olmazsa radar portu oluşmaz.
+# 4) (Sadece eski CH340 adaptörüyle) CH340 sürücüsü (ch341.ko): NVIDIA kernel'inde kapalı.
+#    Radar FTDI ya da CP2102 ile bağlıysa bu adım atlanır (sürücüleri JetPack'te hazır).
 #    Kernel header'larıyla derler, sudo ile kurar. Zaten kuruluysa dokunmaz.
 src/lps_bringup/drivers/ch341/install_ch341.sh
 
-# 5) udev kuralı (/dev/ttyCH340 bağlantısı)
+# 5) udev kuralı (/dev/ttyFTDI, /dev/ttyCP210x, /dev/ttyCH340 bağlantıları + FTDI gecikme 1 ms)
 sudo cp src/lps_bringup/udev/99-usb-serial.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 
@@ -109,14 +110,15 @@ for t in test_tag_fusion test_ir_triangle test_autopilot_rx test_dual_fusion; do
 
 # Servis logu: aşağıdakiler görünmeli
 journalctl -u apriltag_bringup -f
-#   [HRVS] frame=... alt=...            radar ölçüyor (/dev/ttyCH340 var mı: ls -l /dev/ttyCH340)
+#   [HRVS] frame=... alt=...            radar ölçüyor (port var mı: ls -l /dev/ttyFTDI)
+#   [GYROFLOW] OF1 tamam ... OF2 tamam ...   optik akış gyro ile temizleniyor
 #   [APRILTAG] ... Hz                   iki IR kamera geliyor
 #   cpu_apriltag ... max_hamming=1 min_margin=30
 #   car_detector hazir ...              (ilk açılışta ~6 dk motor derlemesinden sonra)
 #   [SERIAL-RX] EKF yuksekligi ... m    otopilot 0x4A gönderiyorsa
 ```
 
-**JetPack/kernel güncellemesi:** Kernel sürümü (`uname -r`) değişirse CH340 sürücüsü yeni sürümde olmaz ve radar gelmez. Güncellemeden sonra `install_ch341.sh` tekrar çalıştırılır. 36.4.x içindeki güncellemelerde sürüm aynı kaldığı için sürücü korunur.
+**JetPack/kernel güncellemesi:** (Sadece CH340 kullanılıyorsa) Kernel sürümü (`uname -r`) değişirse CH340 sürücüsü yeni sürümde olmaz ve radar gelmez. Güncellemeden sonra `install_ch341.sh` tekrar çalıştırılır. 36.4.x içindeki güncellemelerde sürüm aynı kaldığı için sürücü korunur.
 
 **İlk açılış:** Seçili modelin TensorRT motoru oluşturulurken (~6 dk) araç tespiti çalışmaz. Diğer her şey çalışır. Motor model klasörüne yazılır, sonraki açılışlarda 1 sn'de yüklenir. Motorlar TensorRT sürümüne ve GPU'ya özel olduğu için repoda yoktur.
 
@@ -191,6 +193,8 @@ journalctl -u apriltag_bringup -f           # canlı log
 | `car_record` | `true` | EO debug videosu |
 | `car_record_overlay` | `false` | EO videosuna kutu/yazı çizilsin mi. Kapalıyken video temiz (eğitim verisi); kanal, irtifa, kilit, bearing ve kutular aynı adlı `eo_sNNNN_*.csv`'de, video karesiyle satır satır eşleşir. |
 
+**Optik akış ve IMU kaydı (ayrı dosyalar):** `flow_sNNNN_*.csv` her akış karesi bir satır: `kam_t` kamera çekim anı, `all_*` filtresiz ortalama, `tex_*` dokulu hücre ortalaması (ikisi de RANSAC'sız, EMA'sız), `raw_*` RANSAC sonrası, `ema_*` EMA'lı (px/kare). `imu_sNNNN_*.csv` RealSense IMU'su 200 Hz: `stamp_s` (kamera saatiyle aynı), `gx/gy/gz` rad/s, `ax/ay/az` m/s². `imu_log:=false` IMU'yu kapatır.
+
 **Huni ofseti:** Araç kutusunun merkezi huniyi değil aracın ortasını gösterir. car_detector gönderilen yöne `ofset / irtifa` ekler: `funnel_offset_x_m` 0, `funnel_offset_y_m` 1.45 m (kamera ekseni, y + = görüntüde aşağı = aracın arkası; 175/176 uçuşlarında araç kilidi ve tag'in birlikte olduğu 241 andan ölçüldü). 6 m üstünde tam, 3 m altında sıfır. Ofset dron başlığı = araç başlığı iken ölçüldü; 0x4A'daki başlıklarla aradaki fark kadar döndürülür (`funnel_offset_use_heading`, `heading_min_ins` 1 / `heading_max_ins` 3, `heading_stale_s`). İrtifa bayatsa ofset eklenmez. EO CSV'sinde `baslik_farki` sütunu kullanılan farkı yazar.
 | `apriltag_backend` | `cpu` | `cpu` (libapriltag) veya `gpu` (Isaac ROS) |
 | `serial_port` | `/dev/ttyTHS1` | Otopilot portu. Masa testinde sahte port (pty) verilir. |
@@ -229,7 +233,8 @@ Little-endian, packed. Yapılar ve `static_assert`'ler `serial_sender_node.cpp`'
 
 Checksum kuralı her yönde aynı: `headerchk = -(ilk 3 bayt) & 0xFF`, `chksum = -(yük baytları) & 0xFF`.
 
-- **`aprtiltag` ve `opticflow` iki IR kameranın birleşimidir.** AprilTag konumu **platform merkezine göredir**: her kameranın ofseti (infra1 32.962/45 mm, infra2 −17.962/45 mm) kamera ekseninde düşülür, eksenler kamera ekseni kalır. `aprtiltag2` / `opticflow2` sadece infra2'dir (karşılaştırma için). Kapatmak için `dual_camera_fusion:=false`.
+- **`aprtiltag` iki IR kameranın birleşimidir.** AprilTag konumu **platform merkezine göredir**: her kameranın ofseti (infra1 32.962/45 mm, infra2 −17.962/45 mm) kamera ekseninde düşülür, eksenler kamera ekseni kalır. `aprtiltag2` sadece infra2'dir (karşılaştırma için). Kapatmak için `dual_camera_fusion:=false`.
+- **Optik akış (19_11, OKAD gyroflow, `gyroflow.hpp`):** `opticflow` = **sadece infra1**, `opticflow2` = **sadece infra2** (birleşim yok, `flow_fusion` kapalı). Değer: filtresiz akış (`all_dx/all_dy`, RANSAC'sız, EMA'sız) − RealSense gyro'sunun ölçtüğü dönme; birim piksel / nominal 1/30 s kare, kamera ekseni. İki kamera da aynı D435i IMU'suyla beslenir. Gyro gelmezse ya da kare aralığı 15–100 ms dışındaysa paket güncellenmez (eski timestamp). `gyroflow_enable:=false` eski EMA'lı akışa ve akış birleşimine döner. **Otopilot V1.1.3 bu formatı bilmiyor: otopilot güncellenene kadar GPS'li modda uçulmalı.** Kayıt: `flow_sNNNN.csv` (infra1) ve `flow2_sNNNN.csv` (infra2) sonunda `comp_dx_kare, comp_dy_kare, durum` (0 tamam, 1 gyro gelmedi, 2 gyro yok, 3 kare aralığı).
 - **Bearing ve IR alanları metre ya da açı değildir.** İkisi de boyutsuz yön birimidir (X/Z, Y/Z = tan). Değerler kamera optik frame'indedir.
 - **Geçici:** `0x48`'in `cpuTemp` alanında şu an CPU yerine HRVS radarlarının en yüksek çip sıcaklığı gidiyor. Geri almak için launch'ta `serial_sender` parametrelerine `'health_cpu_temp_source': 'cpu'` eklenir.
 
@@ -256,7 +261,7 @@ Kod aynı kalır ama şunlar **mekanik yerleşime bağlı**; kamera, huni ya da 
 | `cam_offset_infra1` / `cam_offset_infra2` | `serial_sender_node.cpp` varsayılanı (32.962/45 ve −17.962/45 mm); launch'ta serial_sender parametresi olarak ezilebilir | Kameradan platform merkezine ofset (kamera ekseninde, m) |
 | Huni tag ofsetleri | `tag_fusion.hpp` `funnelTagMeta()` | Duvar ve küçük tag konumları |
 | LED üçgeni + merkez | launch: `ir_leg_a_m`, `ir_leg_b_m`, `ir_center_on_short_m`, `ir_center_on_long_m` | LED'ler arası ve merkeze mesafeler |
-| Seri port / radar | launch `serial_port`, udev kuralı | Otopilot ve CH340 bağlantısı |
+| Seri port / radar | launch `serial_port`, `hrvs_port`, udev kuralı | Otopilot ve radar (FTDI) bağlantısı |
 
 Kamera intrinsics'i RealSense `camera_info`'dan otomatik gelir; elle girilmez.
 

@@ -1,3 +1,9 @@
+# FTDI FT232R (0403:6001) -> /dev/ttyFTDI   (19_11'den beri HRVS radar adaptoru)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="ttyFTDI", GROUP="dialout", MODE="0666"
+# FTDI gecikme sayaci 16 ms (varsayilan) -> 1 ms: radarin buyuk paketleri (2500 B) parca parca
+# gecikmesin / SDK zaman asimina dusmesin.
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
+
 # CP210x  (10c4:ea60) -> /dev/ttyCP210x
 SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="ttyCP210x", GROUP="dialout", MODE="0666"
 
