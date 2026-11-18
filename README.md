@@ -24,7 +24,7 @@ Bağlantılar:
 | Ne | Port |
 |---|---|
 | Otopilot | `/dev/ttyTHS1`, 115200 baud |
-| HRVS radar | CH340 USB-seri → `/dev/ttyCH340` (udev kuralı), 921600 baud. **Stok JetPack'te CH340 sürücüsü yok**, kurulumda derlenir (adım 4). Port `hrvs_port` ayarı. FTDI (`/dev/ttyFTDI`) ve CP2102 (`/dev/ttyCP210x`) denendi (18–19_11): aynı kabloda hat hataları oldu, radar ölçüm vermedi; udev kuralları duruyor. |
+| HRVS radar | **18_11'den beri STM32 Black Pill USB-TTL** (0483:5740, CDC ACM → `/dev/ttyACM0`, udev → `/dev/ttyBlackPill`), 921600 baud. Sürücüsü (`cdc_acm`) JetPack'te hazır. Port launch argümanı `hrvs_port`. Masa testi 40 s: 0 hata, 0 reset. Önceki adaptör CH340 (`/dev/ttyCH340`; **stok JetPack'te sürücüsü yok**, adım 4) son günlerde 2–4 dk'da bir bozuk yük → reset veriyordu. FTDI (`/dev/ttyFTDI`) ve CP2102 (`/dev/ttyCP210x`) denendi (18–19_11): aynı kabloda hat hataları oldu, radar ölçüm vermedi; udev kuralları duruyor. |
 | HRVS reset/tetik | GPIO PH.07 (gpiochip0, hat 50) |
 | RealSense | USB 3 |
 
@@ -85,12 +85,13 @@ src/car_detector/scripts/install_models.sh
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 
-# 4) CH340 sürücüsü (ch341.ko): NVIDIA kernel'inde kapalı, olmazsa radar portu oluşmaz.
+# 4) CH340 sürücüsü (ch341.ko) — SADECE radar CH340 ile bağlanırsa (18_11'den beri Black Pill, gerekmez).
+#    NVIDIA kernel'inde kapalı, olmazsa CH340 portu oluşmaz.
 #    (Radar FTDI ya da CP2102 ile bağlansaydı gerekmezdi; onların sürücüleri JetPack'te hazır.)
 #    Kernel header'larıyla derler, sudo ile kurar. Zaten kuruluysa dokunmaz.
 src/lps_bringup/drivers/ch341/install_ch341.sh
 
-# 5) udev kuralı (/dev/ttyFTDI, /dev/ttyCP210x, /dev/ttyCH340 bağlantıları + FTDI gecikme 1 ms)
+# 5) udev kuralı (/dev/ttyBlackPill [HRVS], /dev/ttyFTDI, /dev/ttyCP210x, /dev/ttyCH340 + FTDI gecikme 1 ms)
 sudo cp src/lps_bringup/udev/99-usb-serial.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 
@@ -112,7 +113,7 @@ for t in test_tag_fusion test_ir_triangle test_autopilot_rx test_dual_fusion; do
 
 # Servis logu: aşağıdakiler görünmeli
 journalctl -u apriltag_bringup -f
-#   [HRVS] frame=... alt=...            radar ölçüyor (port var mı: ls -l /dev/ttyCH340)
+#   [HRVS] frame=... alt=...            radar ölçüyor (port var mı: ls -l /dev/ttyBlackPill)
 #   [GYROFLOW] OF1 tamam ... OF2 tamam ...   optik akış gyro ile temizleniyor
 #   [APRILTAG] ... Hz                   iki IR kamera geliyor
 #   cpu_apriltag ... max_hamming=1 min_margin=30
@@ -248,7 +249,8 @@ Checksum kuralı her yönde aynı: `headerchk = -(ilk 3 bayt) & 0xFF`, `chksum =
 - Sahte tespit filtresi (`cpu_apriltag_node`): `max_hamming` 1, `min_decision_margin` 30 (launch `APRILTAG_DETECT`). Log `[TAG-FILTRE]` elenenleri yazar.
 - **Geçerlilik kapısı** (`tag_gate.hpp`, serial_sender, kamera başına): tag ancak **3 ardışık** tespitte otopilota geçerli gider; doğrulanmış tag **1.0 s** içinde tekrar görülürse anında geçerli. Neden: ~10 m'de 1–2 karelik tag görüşleri otopilotu inişi askıya almaya götürüyordu (tag → araç ölçümü 1 s kapalı → tag gelmez → konum kaybı). s0133 uçuşunda bu tetik 18 → 6. Parametreler `tag_gate_enable`, `tag_min_consec`, `tag_keep_s`; log `[APRILTAG] … kapi bastirdi i1=… i2=…`.
 - **Tag kaydı** (17_11, serial_sender, `tag_csv`): `tag_sNNNN.csv` — her tespit mesajında (iki kamera) idler, kapı öncesi füzyon (huni merkezi, kamera ekseni, m), kapı sonrası geçerlilik ve pakete giden konum. Eskiden tag konumu yalnız video HUD'undaydı.
-- **Kamera montaj (boresight) düzeltmesi** (17_11, car_detector, sadece araç yönü): OKAD .mat (RTK hedef + tutum) karşılaştırmasında gönderilen yön sabit x +2.2° / y +1.1° fazla çıktı (20–25 m'de 1–2 m, gecikme değil). `car_boresight_x_deg` −2.2, `car_boresight_y_deg` −1.1 (launch argümanı) ile ofset eklenmiş yön döndürülüyor; s0209 verisinde 20–27 m hata 1.08 → 0.26 m. **Otopilot kendi boresight'ını eklerse ikisi 0.0 yapılmalı.** Doğrulama: `python3 -s -W ignore tools/analiz/rtk_bearing.py <OKAD_…mat>`.
+- **Gyroflow τ otomatik** (18_11, `gyroflow_oto_tau.hpp`, OKAD dosyasına dokunmaz): kare–gyro zaman kayması günden güne değişti (s0209 +10, s0216 −2.5, s0217 0 ms; sabit 10 ms bugün akışı 2–3× gürültülü yaptı). 9 aday (−5…+15 ms, 2.5 ms adım), kaliteli karelerde (`raw_q ≥ 30`) telafili akışın ~300 karelik EMA'sı en küçük olan seçilir (%5 histerezis); kayıtlarda kalkışta oturuyor, havada %99–100 en iyi değerin ±2.5 ms içinde. Parametreler `gyroflow_tau_oto` (true), `gyroflow_tau_min_ms/max_ms/bas_ms`, `gyroflow_tau_kalite_min`. Log `[GYROFLOW] … tau X ms (gecis, ogrenilen)`, flow CSV `tau_ms`. Test: `test_gyroflow_oto_tau`.
+- **Kamera montaj (boresight) düzeltmesi** (17_11, car_detector, sadece araç yönü): OKAD .mat (RTK hedef + tutum) karşılaştırmasında gönderilen yön sabit x +2.2° / y +1.1° fazla çıktı (20–25 m'de 1–2 m, gecikme değil). `car_boresight_x_deg` / `car_boresight_y_deg` (launch; 17_11 −2.2/−1.1, **18_11 −1.8/−1.8**: montaj günler arasında ~0.6° oynadı, yerde D435i ivme − otopilot eğimiyle de görüldü) ile ofset eklenmiş yön döndürülüyor; s0209 verisinde 20–27 m hata 1.08 → 0.26 m. **Otopilot kendi boresight'ını eklerse ikisi 0.0 yapılmalı.** Doğrulama: `python3 -s -W ignore tools/analiz/rtk_bearing.py <OKAD_…mat>`.
 - **Araç yönü zaman damgası** (17_11, car_detector): appsrc'ye kendi PTS'imiz yazılıp `NvDsFrameMeta.buf_pts` ile eşleniyor → `/car_detection/bearing` damgası tespit edilen KARENİN çekim zamanı (eskiden o an en son itilen karenin damgasıydı). Log `[CAR-GECIKME] EO çekim->yayın medyan … p90 … ms | damga eşleşmeyen …`, EO CSV'de `gecikme_ms` sütunu. Masa testi: hat gecikmesi medyan ~20 ms. Paketteki `car.timeStamp` alanı değişmedi (serial_sender'a varış anı).
 - **İrtifa kapısı** (17_11, `cpu_apriltag_node`, iki kamerada): tag ~10 m'den okunduğu için AprilTag **≤ 11 m'de açık, > 12 m'de kapalı** (histerezis; `apriltag_alt_gate`, `apriltag_on_m`, `apriltag_off_m`). Kaynak EKF (0x4A), bayatsa (1.5 s) HRVS; **irtifa bilinmiyorsa açık**. Kapalıyken tespit yapılmaz, boş dizi yayınlanır (otopilota tag geçersiz gider). Log `[TAG-IRTIFA]`.
 

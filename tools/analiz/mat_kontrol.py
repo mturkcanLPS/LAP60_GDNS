@@ -21,7 +21,11 @@ def fl(x):
 
 # ---------------- zaman eslemesi: mat t <-> serial ms ----------------
 ots = F('GDNS_OpTimestamp'); ch = np.where(np.r_[True, np.diff(ots) != 0])[0]
-u = ots[ch].copy(); wraps = np.cumsum(np.r_[0, np.diff(u) < -30000]); u = u + wraps * 65536.0
+# 16 bit basa donme: mat zamanindan beklenen artisa en yakin 65536 kati (log bosluklarinda da dogru)
+tc_ = T[ch]; u = np.empty(len(ch)); u[0] = ots[ch[0]]
+for q in range(1, len(ch)):
+    beklenen = u[q - 1] + (tc_[q] - tc_[q - 1]) * 1000.0
+    u[q] = ots[ch[q]] + np.round((beklenen - ots[ch[q]]) / 65536.0) * 65536.0
 FL = [r for r in rd(f'flow_s{ses}_*.csv') if r.get('durum') not in (None, '')]
 ft = np.array([fl(r['t_ms']) for r in FL])
 best = None
@@ -47,7 +51,8 @@ gx = np.array([fl(r['gx']) for r in I]); gy = np.array([fl(r['gy']) for r in I])
 kt = np.array([fl(r['kam_t']) for r in FL]); dur = np.array([r['durum'] for r in FL])
 cols = {k: np.array([fl(r[k]) for r in FL]) for k in ('all_dx', 'all_dy', 'raw_dx', 'raw_dy', 'comp_dx_kare', 'comp_dy_kare')}
 tf = ms2t(ft)
-hgt = np.interp(tf, T, F('LaserAltitude')); vn = np.interp(tf, T, F('Nav_North_Speed')); ve = np.interp(tf, T, F('Nav_East_Speed'))
+# yukseklik EKF'den: lazer 40 m ustunde olcmuyor (18_11)
+hgt = np.interp(tf, T, F('ekfOutPosZ')); vn = np.interp(tf, T, F('Nav_North_Speed')); ve = np.interp(tf, T, F('Nav_East_Speed'))
 psi = np.radians(np.interp(tf, T, np.unwrap(np.radians(F('NavYawFilt'))) * 180 / np.pi))
 vf = np.cos(psi) * vn + np.sin(psi) * ve; vr = -np.sin(psi) * vn + np.cos(psi) * ve
 # gyro donmesi (kesintisiz bolgelerde; saat adimlarini atla)
@@ -63,12 +68,12 @@ for sg in segs:
 dt = np.r_[np.nan, np.diff(kt)]; nrm = (1 / 30) / dt
 ok = (dur == '0') & (hgt > 4) & np.isfinite(thx) & (dt > 0.015) & (dt < 0.1)
 cand = {
-    'gonderilen (s0209: raw+gyro)': (cols['comp_dx_kare'], cols['comp_dy_kare']),
+    'gonderilen (paket)': (cols['comp_dx_kare'], cols['comp_dy_kare']),
     'all + gyro (simdiki varsayilan)': ((cols['all_dx'] + 845 * thy) * nrm, (cols['all_dy'] - 740 * thx) * nrm),
     'raw + gyro': ((cols['raw_dx'] + 845 * thy) * nrm, (cols['raw_dy'] - 740 * thx) * nrm),
     'all, gyro YOK': (cols['all_dx'] * nrm, cols['all_dy'] * nrm),
 }
-print(f'   havada (lazer > 4 m) {ok.sum()} kare | beklenen akis = hiz / yukseklik (INS N/E + yaw -> govde)')
+print(f'   havada (EKF z > 4 m) {ok.sum()} kare | beklenen akis = hiz / yukseklik (INS N/E + yaw -> govde)')
 print('   girdi                              | dx~sag hiz: kazanc  R2  | dy~ileri hiz: kazanc  R2  | hiz hatasi std (m/s) sag/ileri')
 for nm, (cx, cy) in cand.items():
     k = ok & np.isfinite(cx) & np.isfinite(cy)
@@ -78,6 +83,14 @@ for nm, (cx, cy) in cand.items():
     ex = (cx[k] - ax_[1]) / ax_[0] * hgt[k] - vr[k]; ey = (cy[k] - ay_[1]) / ay_[0] * hgt[k] - vf[k]
     print(f'   {nm:34s} | {ax_[0]:7.1f}  {r2x:.2f}         | {ay_[0]:7.1f}  {r2y:.2f}          | {np.std(ex):.2f} / {np.std(ey):.2f}')
 print(f'   (kazanc = px/kare / (1/s); beklenen ~ -/+ f/30 ~ 21-25. Isaret eksen yonunu gosterir.)')
+# irtifa bantlari: SABIT kazancla (s0209'dan: dx -21.6, dy +22.3) hiz tahmini -> INS'e gore hata
+cx, cy = cand['gonderilen (paket)']
+print('   gonderilen akis, sabit kazancla hiz hatasi (INS hizina gore):  EKF z | n | hata std sag/ileri (m/s) | hiz std sag/ileri (INS)')
+for lo, hi in ((4, 10), (10, 20), (20, 30), (30, 45), (45, 70)):
+    k = ok & np.isfinite(cx) & (hgt >= lo) & (hgt < hi)
+    if k.sum() < 50: continue
+    er = cx[k] / -21.6 * hgt[k] - vr[k]; ef = cy[k] / 22.3 * hgt[k] - vf[k]
+    print(f'      {lo:2d}-{hi:2d} m | {k.sum():5d} | {np.std(er):.2f} / {np.std(ef):.2f} | {np.std(vr[k]):.2f} / {np.std(vf[k]):.2f}')
 
 # ---------------- 2) ARAC YONU vs RTK ----------------
 bx, by, cts = F('GDNS_CarBearingX'), F('GDNS_CarBearingY'), F('GDNS_CarTimestamp')
@@ -96,7 +109,7 @@ def bore(bx_, by_, xd, yd):
 cx_, cy2 = bore(sx, sy, *BORE)
 print(f'\n[2] ARAC YONU vs RTK: {len(idx)} olcum | montaj duzeltmesi simulasyonu x {BORE[0]:+.1f} y {BORE[1]:+.1f} der')
 print('   RTK D (m)  |  n   | hata medyan (m): gonderilen -> duzeltmeli | p90 gonderilen -> duzeltmeli')
-for lo, hi in ((2.5, 8), (8, 14), (14, 20), (20, 30)):
+for lo, hi in ((2.5, 8), (8, 14), (14, 20), (20, 30), (30, 45), (45, 70)):
     k = (h >= lo) & (h < hi)
     if k.sum() < 15: continue
     e0 = np.hypot(px[k] - sx[k], py[k] - sy[k]) * h[k]; e1 = np.hypot(px[k] - cx_[k], py[k] - cy2[k]) * h[k]

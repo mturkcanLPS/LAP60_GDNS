@@ -43,7 +43,9 @@
 #include "lps_serial_sender/ir_triangle.hpp"      // IR blob tespiti + ucgen eslesmesi
 #include "lps_serial_sender/tag_fusion.hpp"       // AprilTag -> avgPos (infra2 ile ORTAK)
 #include "lps_serial_sender/tag_gate.hpp"
-#include "lps_serial_sender/gyroflow.hpp"         // 19_11: OKAD gyroflow (OF1/OF2 donme telafisi)         // 08_11: kisa tag goruslerini otopilota gonderme
+#include "lps_serial_sender/gyroflow.hpp"
+#include "lps_serial_sender/gyroflow_oto_tau.hpp"
+   // 18_11: kare-gyro zaman kaymasi otomatik         // 19_11: OKAD gyroflow (OF1/OF2 donme telafisi)         // 08_11: kisa tag goruslerini otopilota gonderme
 #include "lps_serial_sender/frame_gap_stats.hpp"  // akis kare araligi duzenliligi
 #include "lps_serial_sender/system_health.hpp"    // Jetson sicaklik/yuk/guc -> health alani
 #include "lps_serial_sender/autopilot_rx.hpp"     // otopilot -> Jetson mesajlari (0x49 KAPAT)
@@ -104,7 +106,7 @@ using namespace hrvs_sdk;
 // (19_11) denendi; CP2102 ve FTDI ile hatta break/frame/overrun hatalari oldu, radar olcum vermedi.
 // 17_11 tekrar CH340: 0 hata, 4 radar. CH340 surucusu (ch341.ko) JetPack'te YOK, elle derlenir
 // (install_ch341.sh). Diger adaptorler icin udev: /dev/ttyFTDI, /dev/ttyCP210x.
-static constexpr char     HRVS_UART_PORT_DEFAULT[] = "/dev/ttyCH340";
+static constexpr char     HRVS_UART_PORT_DEFAULT[] = "/dev/ttyBlackPill";   // 18_11 STM32 Black Pill USB-TTL
 static constexpr int      HRVS_UART_BAUDRATE  = 921600;
 static constexpr unsigned HRVS_RADARS_NUMBER  = 4;
 static constexpr unsigned HRVS_GPIO_PIN_ID    = 398;
@@ -611,7 +613,7 @@ public:
                 // 19_11: comp_dx_kare/comp_dy_kare = gyroflow OF1 (pakete giden, px / nominal 1/30 s kare),
                 // durum: 0 Tamam, 1 GyroGelmedi, 2 GyroYok, 3 KareAraligi, -1 gyroflow kapali.
                 flow_csv_ << "t_ms,kam_t,all_dx,all_dy,tex_dx,tex_dy,tex_n,raw_dx,raw_dy,raw_q,"
-                             "ema_dx,ema_dy,ema_q,consist,tex,g50,g90,comp_dx_kare,comp_dy_kare,durum\n";
+                             "ema_dx,ema_dy,ema_q,consist,tex,g50,g90,comp_dx_kare,comp_dy_kare,durum,tau_ms\n";
                 flow_csv_.flush();
                 RCLCPP_INFO(get_logger(), "Ham akis CSV: %s", path.c_str());
             } else {
@@ -675,6 +677,21 @@ public:
                 } else {
                     RCLCPP_ERROR(get_logger(), "IMU CSV acilamadi: %s", path.c_str());
                 }
+            }
+            // 18_11: gyroflow kare-gyro zaman kaymasi (tau) ucusta otomatik secilir (gyroflow_oto_tau.hpp).
+            // Kayitlar: en iyi tau s0209 +10, s0216 -2.5, s0217 0 ms; sabit 10 ms bugun akisi 2-3x gurultulu
+            // yapti. IMU aboneliginden ONCE kurulmali (onImu adaylari besler).
+            {
+                GyroFlowOtoTau::Ayar ta;
+                ta.oto     = declare_parameter<bool>("gyroflow_tau_oto", true);
+                ta.tau_min = declare_parameter<double>("gyroflow_tau_min_ms", -5.0) / 1000.0;
+                ta.tau_max = declare_parameter<double>("gyroflow_tau_max_ms", 15.0) / 1000.0;
+                ta.tau_bas = declare_parameter<double>("gyroflow_tau_bas_ms", 10.0) / 1000.0;
+                gf_tau_q_min_ = declare_parameter<int>("gyroflow_tau_kalite_min", 30);
+                gf1_ = GyroFlowOtoTau(ta);
+                gf2_ = GyroFlowOtoTau(ta);
+                RCLCPP_INFO(get_logger(), "Gyroflow tau: %s (aday %.1f..%.1f ms, baslangic %.1f ms, ogrenme kalite >= %d)",
+                            ta.oto ? "OTOMATIK" : "SABIT", ta.tau_min * 1e3, ta.tau_max * 1e3, ta.tau_bas * 1e3, gf_tau_q_min_);
             }
             imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
                 declare_parameter<std::string>("imu_topic", "/camera/camera/imu"),
@@ -1119,6 +1136,7 @@ private:
             if (++flow2_lines_ % 15 == 0) flow2_csv_.flush();
         }
         const bool ok = d == GyroFlowDurum::Tamam;
+        if (ok && q >= gf_tau_q_min_) gf2_.ogren(tK, tO, dx, dy);   // 18_11 tau ogrenme
         if (!ok && !gf_invalid_q0_) return;   // paket guncellenmez (eski timestamp)
         opticFlowPack_t of{};
         of.timestamp   = msSinceStart();
@@ -1136,13 +1154,14 @@ private:
         auto& a = gf_cnt_[0]; auto& b = gf_cnt_[1];
         if (of2_en_)
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
-                "[GYROFLOW] (%s) OF1 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u | OF2 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u",
-                gf_input_raw_ ? "raw" : "all", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load(),
-                b[0].load(), b[1].load(), b[2].load(), b[3].load(), b[4].load());
+                "[GYROFLOW] (%s) OF1 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u tau %.1f ms | OF2 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u tau %.1f ms",
+                gf_input_raw_ ? "raw" : "all", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load(), gf1_.tau() * 1e3,
+                b[0].load(), b[1].load(), b[2].load(), b[3].load(), b[4].load(), gf2_.tau() * 1e3);
         else
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
-                "[GYROFLOW] (%s) OF1 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u | OF2 kapali",
-                gf_input_raw_ ? "raw" : "all", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load());
+                "[GYROFLOW] (%s) OF1 tamam %u gelmedi %u gyro-yok %u aralik %u akis-yok %u | tau %.1f ms (gecis %u, ogrenilen %ld) | OF2 kapali",
+                gf_input_raw_ ? "raw" : "all", a[0].load(), a[1].load(), a[2].load(), a[3].load(), a[4].load(),
+                gf1_.tau() * 1e3, gf1_.gecis(), gf1_.ogrenilen());
     }
 
     void flowCb2(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
@@ -1524,6 +1543,8 @@ private:
                     }
                 }
                 if (gd != GF_AKIS_YOK) gd = (int)d;
+                if (gd == (int)GyroFlowDurum::Tamam && r.raw_quality >= gf_tau_q_min_)
+                    gf1_.ogren(stamp_s, t_prev, in_dx, in_dy);   // 18_11 tau ogrenme
                 gfCount(1, gd);
                 of_ok = gd == (int)GyroFlowDurum::Tamam;
                 if (of_ok) {
@@ -1545,12 +1566,10 @@ private:
                           << r.dx << ',' << r.dy << ',' << (unsigned)r.quality << ','
                           << r.consist << ',' << r.tex_ratio << ','
                           << (unsigned)r.tex_p50 << ',' << (unsigned)r.tex_p90 << ',';
-                if (gd == 0) {
-                    char b[64]; std::snprintf(b, sizeof(b), "%.4f,%.4f,0\n", gs.comp_dx_kare, gs.comp_dy_kare);
-                    flow_csv_ << b;
-                } else {
-                    flow_csv_ << ",," << gd << '\n';
-                }
+                char b[96];
+                if (gd == 0) std::snprintf(b, sizeof(b), "%.4f,%.4f,0,%.1f\n", gs.comp_dx_kare, gs.comp_dy_kare, gf1_.tau() * 1e3);
+                else         std::snprintf(b, sizeof(b), ",,%d,%.1f\n", gd, gf1_.tau() * 1e3);
+                flow_csv_ << b;
                 if (++csv_lines_ % 15 == 0) flow_csv_.flush();
             }
 
@@ -2338,12 +2357,13 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr alt_pub_;   // HRVS irtifasi (yeni karede)
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ekf_alt_pub_;   // otopilot 0x4A (RX thread)
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr heading_pub_;   // 0x4A basliklari
-    std::string hrvs_port_ = HRVS_UART_PORT_DEFAULT;   // radar UART (CH340)
+    std::string hrvs_port_ = HRVS_UART_PORT_DEFAULT;   // radar UART (Black Pill, launch hrvs_port)
     bool             imu_enable_ = false;
     // 19_11 gyroflow (OF1 = infra1, OF2 = infra2; ayni IMU)
     bool             gyroflow_en_ = true, flow_fusion_ = false, gf_invalid_q0_ = true;
     bool             gf_input_raw_ = true, of2_en_ = false;
-    GyroFlow         gf1_, gf2_;
+    GyroFlowOtoTau   gf1_, gf2_;   // 18_11: tau otomatik (gyroflow_oto_tau.hpp)
+    int              gf_tau_q_min_ = 30;
     double           gf_prev1_ = 0.0;   // VPI thread'i
     double           gf_prev2_ = 0.0;   // executor
     struct Pend2 { bool active = false; double tK = 0, tO = 0; float dx = 0, dy = 0; uint8_t q = 0; } pend2_;

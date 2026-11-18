@@ -17,3 +17,5 @@
 - [Yeni Jetson kurulum dokümanı](new-jetson-setup-doc.md) — YENI_JETSON.md + README (07_11); sistem ayarı değişirse oraya da yaz; eski GDNS.service taşınmamalı
 - [Huni tag kalibrasyonu 05_11](funnel-tag-calibration.md) — referans = küçük tag plakası; duvar (0,.3004,-.0959) 26 cm; küçük 10/12/14/16 65 mm x ±4.5, y +7.54/−6.46 cm z=0 (canlı doğrulandı; 10/16 nadir, kablo); 25h9 sahte tespit filtresi; canlı kalibrasyon tuzakları
 - [Uçuşlar 209/210 17_11](flights-209-210.md) — havada NTP adımı → akış 18 s kesik; HRVS kalkışta koptu; huni yönü OKAD .mat RTK ile: SABİT ~2–3° kamera açı farkı (20–25 m'de 1–2 m), gecikme değil; gyroflow girdisi uçuşta all daha iyi
+- [HRVS Black Pill 18_11](hrvs-blackpill.md) — radar artık STM32 Black Pill USB-TTL (/dev/ttyBlackPill, cdc_acm hazır); masa 0 hata; CH340 2–4 dk'da reset veriyordu
+- [Uçuşlar 216/217 18_11](flights-216-217.md) — 55 m'de car bearing doğru (0.85 m); görülen 5 m = eğim düzeltmesiz + lazer >40 m ölçmüyor; gyroflow tau bugün ~0 ms (10 yanlış, 3× gürültü); HRVS kalkışta koptu (CH340)

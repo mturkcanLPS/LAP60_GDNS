@@ -186,9 +186,9 @@ def generate_launch_description():
         description='Alcalirken bu irtifanin altinda IR modeline gec (m)')
     car_switch_up_arg = DeclareLaunchArgument('car_switch_up_m', default_value='18.0',
         description='Yukselirken bu irtifanin ustunde EO modeline don (m)')
-    car_bore_x_arg = DeclareLaunchArgument('car_boresight_x_deg', default_value='-2.2',
+    car_bore_x_arg = DeclareLaunchArgument('car_boresight_x_deg', default_value='-1.8',
         description='Arac yonu kamera montaj duzeltmesi, x (der). Otopilot duzeltirse 0.0')
-    car_bore_y_arg = DeclareLaunchArgument('car_boresight_y_deg', default_value='-1.1',
+    car_bore_y_arg = DeclareLaunchArgument('car_boresight_y_deg', default_value='-1.8',
         description='Arac yonu kamera montaj duzeltmesi, y (der). Otopilot duzeltirse 0.0')
     car_model_arg = DeclareLaunchArgument('car_model', default_value=CAR_MODEL_DEFAULT,
         description='Arac modeli giris boyutu: ' + ' | '.join(CAR_MODELS))
@@ -202,6 +202,8 @@ def generate_launch_description():
     # Seri cikis. Olcum/masa testinde sahte porta (pty) yonlendirmek icin —
     # otopilota henuz tanimadigi paket gitmesin.
     serial_port_arg = DeclareLaunchArgument('serial_port', default_value='/dev/ttyTHS1')
+    # 18_11: HRVS radar portu (Black Pill USB-TTL, udev 99-usb-serial.rules).
+    hrvs_port_arg = DeclareLaunchArgument('hrvs_port', default_value='/dev/ttyBlackPill')
     # IR LED penceresi icin irtifa kaynagi (06_11): auto = EKF, yoksa HRVS (UCUS).
     # tag = AprilTag z — SADECE yer/vinc testi (radar tavani okur). Ucusta auto kalmali.
     ir_alt_source_arg = DeclareLaunchArgument('ir_alt_source', default_value='auto')
@@ -462,6 +464,10 @@ def generate_launch_description():
                 # 17_11: kamera montaj (boresight) duzeltmesi. OKAD .mat RTK karsilastirmasi (s0209,
                 # 8464 olcum, 8-27 m): gonderilen yon sabit x +2.2 / y +1.1 der fazlaydi -> 20-25 m'de
                 # ~1-2 m. Duzeltmeyle 1.08 -> 0.26 m. Otopilota boresight eklenince 0.0 yapilmali.
+                # 18_11: s0216/s0217 (60/40 m) RTK'ya gore -2.2/-1.1 ile kalan x +0.38, y -0.68 der ->
+                # -1.8/-1.8. Yerde D435i ivme - otopilot egimi de montajin 17_11 -> 18_11 x'te ~0.6 der
+                # degistigini gosterdi (kalibrasyon yok -> mekanik: braket boslugu?). Her ucustan sonra
+                # tools/analiz/mat_kontrol.py ile kontrol.
                 'car_boresight_x_deg': ParameterValue(LaunchConfiguration('car_boresight_x_deg'), value_type=float),
                 'car_boresight_y_deg': ParameterValue(LaunchConfiguration('car_boresight_y_deg'), value_type=float),
             }],
@@ -581,10 +587,11 @@ def generate_launch_description():
             'ir_csv':        True,
             # 12_11: otopilot RX kaydi (rx_sNNNN.csv): her 0x4A + saniyelik ozet. ~10 satir/s.
             'rx_csv':        True,
-            # 17_11: HRVS radar adaptoru tekrar CH340 (/dev/ttyCH340), 921600 baud. FTDI ve CP2102
-            # ile ayni kabloda hat hatalari (break/frame/overrun) vardi, radar olcum vermedi; CH340 ile
-            # 30 s'de 0 hata, 4 radar. FTDI: '/dev/ttyFTDI', CP2102: '/dev/ttyCP210x'.
-            'hrvs_port':     '/dev/ttyCH340',
+            # 18_11: HRVS radar adaptoru STM32 Black Pill USB-TTL (0483:5740, CDC ACM, udev ->
+            # /dev/ttyBlackPill). Masa testi 40 s: 0 hata, 0 reset, 4 radar x 103 mesaj. CH340 bu sabah
+            # 2-4 dk'da bir bozuk yuk -> reset veriyordu. Eski adaptorler: hrvs_port:=/dev/ttyCH340 |
+            # /dev/ttyFTDI | /dev/ttyCP210x (FTDI/CP2102 ayni kabloda hat hatasi vermisti).
+            'hrvs_port':     LaunchConfiguration('hrvs_port'),
         }],
     )
 
@@ -614,6 +621,7 @@ def generate_launch_description():
         camera_fps_arg,
         infra2_equal_arg,
         serial_port_arg,
+        hrvs_port_arg,
         ir_alt_source_arg,
         fastdds_shm_arg,
         apriltag_every_n_arg,

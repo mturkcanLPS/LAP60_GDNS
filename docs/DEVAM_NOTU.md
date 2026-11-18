@@ -43,7 +43,7 @@ Uçuş kayıtları (`/home/lapis/lps_records`, video/CSV) repoda **yok**; boyutl
 - 0x4A (19 B, OKAD V1.1.3): EKF yüksekliği + dron/araç başlığı + INS durumu. 0x49: KAPAT.
 
 **Donanım**
-- HRVS radar CH340 ile (`/dev/ttyCH340`, 921600). FTDI ve CP2102 aynı kabloda hat hatası verdi.
+- HRVS radar **18_11'den beri STM32 Black Pill USB-TTL** ile (`/dev/ttyBlackPill`, 921600; masa 40 s: 0 hata). CH340 son günlerde 2–4 dk'da bir bozuk yük → reset veriyordu; FTDI ve CP2102 aynı kabloda hat hatası verdi.
 - HRVS her kalkışta kopuyor: kalkış titreşim darbesinde (IMU ile görüldü), inişte geri geliyor. Elle sallamada da kopuyor → gevşek konnektör/kablo şüphesi. **Donanım tarafında çözülmedi.**
 - Jetson boşta 90 °C civarında çalışabiliyor; kapak/hava akışı kontrol edilmeli.
 
@@ -59,5 +59,5 @@ Uçuş kayıtları (`/home/lapis/lps_records`, video/CSV) repoda **yok**; boyutl
 | Kendi araç/huni modelini eğitmek | EO videosu artık overlay'siz kaydediliyor (`eo_sNNNN.csv` kutularla). Veri birikince GPU'lu PC'de ince ayar. |
 | Journal kaybı | `ucus_sistem_ayar.sh` ile kalıcı journal (yukarıda). HRVS SDK TRACE journal'ın ~%65'i ama SDK log ayarına dokunmak 22_10'da çökme yaptı → dokunulmadı, 1 GB sınırı yeterli. Tag konumları artık `tag_sNNNN.csv`'de. |
 | Otopilotun 0x42 yankısı | 17_11 uçuşlarında artık yok (n_42 = 0). |
-| **Kamera montaj açısı (car bearing)** | 17_11 OKAD .mat (RTK hedef + tutum) ile: gönderilen yön ile RTK'dan beklenen arasında SABİT açı farkı x −2.2…−3.0°, y −1.1° (gecikme değil; tarama düz). 20–27 m'de 1.08 m → düzeltmeyle 0.26 m (T02'de çapraz doğrulama 0.50 → 0.23). **Şimdilik Jetson'da düzeltildi** (kullanıcı kararı, 18_11 uçuşu için): launch `car_boresight_x_deg:=-2.2`, `car_boresight_y_deg:=-1.1` (car_detector, ofset sonrası yöne dönme). Kullanıcı otopilot tarafına iletecek; otopilot boresight eklerse bu iki değer **0.0** yapılmalı (yoksa iki kez düzeltilir). Tag/IR'ye uygulanmadı. Betik `tools/analiz/rtk_bearing.py`. |
+| **Kamera montaj açısı (car bearing)** | 17_11 OKAD .mat (RTK hedef + tutum) ile: gönderilen yön ile RTK'dan beklenen arasında SABİT açı farkı x −2.2…−3.0°, y −1.1° (gecikme değil; tarama düz). 20–27 m'de 1.08 m → düzeltmeyle 0.26 m (T02'de çapraz doğrulama 0.50 → 0.23). **Şimdilik Jetson'da düzeltildi**: launch `car_boresight_x_deg`/`y_deg` (17_11 −2.2/−1.1 → 18_11 **−1.8/−1.8**; montaj günler arasında ~0.6° oynuyor, mekanik kontrol önerildi) (car_detector, ofset sonrası yöne dönme). Kullanıcı otopilot tarafına iletecek; otopilot boresight eklerse bu iki değer **0.0** yapılmalı (yoksa iki kez düzeltilir). Tag/IR'ye uygulanmadı. Betik `tools/analiz/rtk_bearing.py`. |
 | NTP havada saati adımladı + journal kaybı | s0209'da 25 m'de +8978 s → akış 18 s kesik. Çözüm script'i: `sudo src/lps_bringup/scripts/ucus_sistem_ayar.sh` (kalıcı journal, NTP kapalı, saat dakikada bir kaydedilir). Kullanıcı çalıştıracak. |
