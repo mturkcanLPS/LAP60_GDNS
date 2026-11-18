@@ -159,9 +159,9 @@ def generate_launch_description():
     car_record_overlay_arg = DeclareLaunchArgument('car_record_overlay', default_value='false')
     # RealSense IMU'sunu ac ve imu_sNNNN.csv'ye yaz. USB'de ek akis: sorun cikarirsa false.
     imu_log_arg = DeclareLaunchArgument('imu_log', default_value='true')
-    # 17_11: gyroflow girdisi. raw = RANSAC'li, EMA'siz akis + o karenin kalitesi (masada gurultu
-    # all'in ~yarisi). all = tum hucre ortalamasi (OKAD ilk surum).
-    gyroflow_input_arg = DeclareLaunchArgument('gyroflow_input', default_value='raw')
+    # 17_11: gyroflow girdisi. all (VARSAYILAN) = tum hucre ortalamasi; OKAD kazanclari buna gore,
+    # ucusta (s0209/s0210) telafi sonrasi en temiz. raw = RANSAC'li (ucusta olcek ~%9 kucuk).
+    gyroflow_input_arg = DeclareLaunchArgument('gyroflow_input', default_value='all')
     # 17_11: OF2 (infra2 optik akisi). Kapali: opticflow2 alani sifir/quality 0, infra2 VPI
     # akisi hesaplanmaz (~0.3 cekirdek + OFA infra1'e kalir). infra2 tag + video devam eder.
     of2_arg = DeclareLaunchArgument('of2', default_value='false')
@@ -186,6 +186,10 @@ def generate_launch_description():
         description='Alcalirken bu irtifanin altinda IR modeline gec (m)')
     car_switch_up_arg = DeclareLaunchArgument('car_switch_up_m', default_value='18.0',
         description='Yukselirken bu irtifanin ustunde EO modeline don (m)')
+    car_bore_x_arg = DeclareLaunchArgument('car_boresight_x_deg', default_value='-2.2',
+        description='Arac yonu kamera montaj duzeltmesi, x (der). Otopilot duzeltirse 0.0')
+    car_bore_y_arg = DeclareLaunchArgument('car_boresight_y_deg', default_value='-1.1',
+        description='Arac yonu kamera montaj duzeltmesi, y (der). Otopilot duzeltirse 0.0')
     car_model_arg = DeclareLaunchArgument('car_model', default_value=CAR_MODEL_DEFAULT,
         description='Arac modeli giris boyutu: ' + ' | '.join(CAR_MODELS))
     # Kamera kare hizi (IR 1280x720: 6 / 15 / 30). Iki kamera donanimda senkron;
@@ -455,6 +459,11 @@ def generate_launch_description():
                 'funnel_offset_y_m': 1.45,
                 'funnel_offset_zero_m': 3.0,
                 'funnel_offset_full_m': 6.0,
+                # 17_11: kamera montaj (boresight) duzeltmesi. OKAD .mat RTK karsilastirmasi (s0209,
+                # 8464 olcum, 8-27 m): gonderilen yon sabit x +2.2 / y +1.1 der fazlaydi -> 20-25 m'de
+                # ~1-2 m. Duzeltmeyle 1.08 -> 0.26 m. Otopilota boresight eklenince 0.0 yapilmali.
+                'car_boresight_x_deg': ParameterValue(LaunchConfiguration('car_boresight_x_deg'), value_type=float),
+                'car_boresight_y_deg': ParameterValue(LaunchConfiguration('car_boresight_y_deg'), value_type=float),
             }],
         )
         )
@@ -590,6 +599,8 @@ def generate_launch_description():
         car_record_overlay_arg,
         imu_log_arg,
         gyroflow_input_arg,
+        car_bore_x_arg,
+        car_bore_y_arg,
         of2_arg,
         apriltag_alt_gate_arg,
         apriltag_on_m_arg,

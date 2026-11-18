@@ -44,6 +44,7 @@ Yeni Jetson'da bunlar **yok**, elle yapılmalı. Komutlar README'de.
 | Kullanıcı grupları | `lapis`: `dialout video gpio i2c render plugdev` | Servis root olduğu için şart değil. Yığını elle `lapis` ile çalıştıracaksan: `sudo usermod -aG dialout,video,gpio,i2c,render,plugdev lapis` |
 | RealSense sürümü sabit | `apt-mark hold` (2.57.7 / 4.57.7) | Tavsiye, README "Tavsiyeler" |
 | Otomatik güncelleme kapalı | packagekit, apt-daily, fwupd maskeli | Tavsiye: `scripts/otomatik_guncelleme_kapat.sh` |
+| Kalıcı journal + NTP kapalı + bluetooth debug kapalı (17_11) | `/var/log/journal` (1 GB, 10 s senkron), timesyncd NTP sunucusuz (saat son kayıttan, dakikada bir kaydedilir), bluetoothd LogLevelMax=info | **Gerekli:** `sudo src/lps_bringup/scripts/ucus_sistem_ayar.sh`. Masada saat eşitlemek için `… saat`, geri almak için `… geri`. Sebep: s0209'da havada NTP saati 2.5 saat attı → akış 18 s kesik; journal RAM'deydi → uçuş logu kayboluyordu. |
 | jtop (jetson-stats) | Kurulu, servis açık | İsteğe bağlı. İzleme betikleri `tegrastats` kullanır, jtop'a gerek yok. |
 
 ## Bilerek değiştirilmemiş varsayılanlar

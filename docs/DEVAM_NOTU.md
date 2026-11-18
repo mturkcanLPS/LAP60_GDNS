@@ -57,5 +57,7 @@ Uçuş kayıtları (`/home/lapis/lps_records`, video/CSV) repoda **yok**; boyutl
 | Huni ofseti döndürme yönü | İlk başlık farklı uçuşta EO CSV `baslik_farki` + video ile doğrulanacak. |
 | Tag menzili | 26 cm tag ~9–11 m'den sonra okunmuyor; hesap çözünürlük sınırını gösteriyor. 6–12 m'den ham kare kaydıyla margin filtresi doğrulanabilir. |
 | Kendi araç/huni modelini eğitmek | EO videosu artık overlay'siz kaydediliyor (`eo_sNNNN.csv` kutularla). Veri birikince GPU'lu PC'de ince ayar. |
-| Journal kaybı | Güç ani kesilince sistem logu kayboluyor; HRVS SDK TRACE satırları journal'ın çoğunu dolduruyor. Önerildi, yapılmadı. |
-| Otopilotun 0x42 yankısı | Otopilot bizim paketimizi geri gönderiyor; sorulmadı/çözülmedi. |
+| Journal kaybı | `ucus_sistem_ayar.sh` ile kalıcı journal (yukarıda). HRVS SDK TRACE journal'ın ~%65'i ama SDK log ayarına dokunmak 22_10'da çökme yaptı → dokunulmadı, 1 GB sınırı yeterli. Tag konumları artık `tag_sNNNN.csv`'de. |
+| Otopilotun 0x42 yankısı | 17_11 uçuşlarında artık yok (n_42 = 0). |
+| **Kamera montaj açısı (car bearing)** | 17_11 OKAD .mat (RTK hedef + tutum) ile: gönderilen yön ile RTK'dan beklenen arasında SABİT açı farkı x −2.2…−3.0°, y −1.1° (gecikme değil; tarama düz). 20–27 m'de 1.08 m → düzeltmeyle 0.26 m (T02'de çapraz doğrulama 0.50 → 0.23). **Şimdilik Jetson'da düzeltildi** (kullanıcı kararı, 18_11 uçuşu için): launch `car_boresight_x_deg:=-2.2`, `car_boresight_y_deg:=-1.1` (car_detector, ofset sonrası yöne dönme). Kullanıcı otopilot tarafına iletecek; otopilot boresight eklerse bu iki değer **0.0** yapılmalı (yoksa iki kez düzeltilir). Tag/IR'ye uygulanmadı. Betik `tools/analiz/rtk_bearing.py`. |
+| NTP havada saati adımladı + journal kaybı | s0209'da 25 m'de +8978 s → akış 18 s kesik. Çözüm script'i: `sudo src/lps_bringup/scripts/ucus_sistem_ayar.sh` (kalıcı journal, NTP kapalı, saat dakikada bir kaydedilir). Kullanıcı çalıştıracak. |

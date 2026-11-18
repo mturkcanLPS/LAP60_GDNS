@@ -68,7 +68,7 @@ public:
         flow_enabled_ = declare_parameter<bool>("flow_enabled", true);
         // 17_11: gyroflow girdisi. "raw" = RANSAC'li, EMA'siz (z = o karenin kalitesi, RANSAC
         // model bulamazsa 0); "all" = tum hucrelerin duz ortalamasi (OKAD ilk surum).
-        gyroflow_input_raw_ = declare_parameter<std::string>("gyroflow_input", "raw") != "all";
+        gyroflow_input_raw_ = declare_parameter<std::string>("gyroflow_input", "all") == "raw";
         // Akis sonucu buradan yayinlanir -> serial_sender opticflow2'ye koyar.
         flow_topic_ = declare_parameter<std::string>("flow_topic", "/infra2/optical_flow");
         // 19_11 gyroflow: serial_sender OF2'yi infra2'nin FILTRESIZ akisindan hesaplar
@@ -253,7 +253,7 @@ private:
             // all: tum hucrelerin duz ortalamasi, z = EMA'li quality.
             m.vector.x = gyroflow_input_raw_ ? r.raw_dx : r.all_dx;
             m.vector.y = gyroflow_input_raw_ ? r.raw_dy : r.all_dy;
-            if (gyroflow_input_raw_) m.vector.z = r.raw_ok ? r.raw_quality : 0;
+            m.vector.z = gyroflow_input_raw_ ? (r.raw_ok ? r.raw_quality : 0) : r.raw_quality;   // o karenin kalitesi
             flow_raw_pub_->publish(m);
         }
     }

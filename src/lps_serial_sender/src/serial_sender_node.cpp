@@ -706,6 +706,27 @@ public:
             }
         }
 
+        // 17_11: tag kaydi (tag_sNNNN.csv). Eskiden tag konumu yalniz videonun HUD'undaydi
+        // (analizde OCR ile okunuyordu). Her tespit mesajinda (iki kamera, ~2 x 15 satir/s):
+        // ham fuzyon (kapi ONCESI) + kapi sonrasi gecerlilik + pakete giden konum.
+        if (declare_parameter<bool>("tag_csv", true)) {
+            const std::string dir = has_parameter("record_dir")
+                ? get_parameter("record_dir").as_string()
+                : declare_parameter<std::string>("record_dir", "/home/lapis/lps_records");
+            const std::string path = lps::claimRecordPath(dir, "tag", record_session_, "csv");
+            tag_csv_.open(path);
+            if (tag_csv_) {
+                // kam_t: kamera cekim ani [s]; n: tespit sayisi; idler ';' ayrik.
+                // ham_*: fuzyon (huni merkezi, kamera ekseni, m, kapi oncesi); kapi: otopilota
+                // gecerli gitti mi; pk_*: pakete giden (platform merkezi ofseti dusulmus) konum.
+                tag_csv_ << "t_ms,kam,kam_t,n,idler,ham_gecerli,ham_x,ham_y,ham_z,id_bits,kapi,pk_x,pk_y,pk_z\n";
+                tag_csv_.flush();
+                RCLCPP_INFO(get_logger(), "Tag CSV: %s", path.c_str());
+            } else {
+                RCLCPP_ERROR(get_logger(), "Tag CSV acilamadi: %s", path.c_str());
+            }
+        }
+
         // Ucus video kaydi (opsiyonel): tespit cerceveleri + akis HUD'lu .avi.
         // Encode ayri DUSUK oncelikli thread'de -> ucus-kritik yolu (serial) yormaz.
         // Acmak icin record_video:=true. record_YYYYmmdd... record_dir'e duser.
@@ -813,10 +834,12 @@ public:
         // dx=dy=0, quality=0 gonderilir -> otopilot "olcum yok"u acikca gorur. false -> OKAD dokumanindaki
         // eski davranis (paket guncellenmez, eski deger eski timestamp ile kalir).
         gf_invalid_q0_ = declare_parameter<bool>("gyroflow_invalid_q0", true);
-        // 17_11: gyroflow girdisi. "raw" (varsayilan) = RANSAC'li, EMA'siz akis + o karenin kalitesi;
-        // RANSAC model bulamazsa kare gecersiz (durum 4). "all" = tum hucre ortalamasi (OKAD ilk surum),
-        // quality EMA'li. Masa (s0207): raw gurultusu all'in ~yarisi, |p99| 2.5 kat az.
-        gf_input_raw_ = declare_parameter<std::string>("gyroflow_input", "raw") != "all";
+        // 17_11: gyroflow girdisi. "all" (VARSAYILAN) = tum hucre ortalamasi (OKAD kalibrasyonu bununla:
+        // ucusta kazanc 728/-854 ~ OKAD 740/-845, telafi sonrasi kalan 0.51 px). "raw" = RANSAC'li;
+        // ucusta olcegi ~%9 kucuk (697/-768), kalan 0.60 px (s0209/s0210). Masadaki "raw daha iyi"
+        // sonucu dokusuz sahneden yaniltici cikti. raw'da RANSAC model bulamazsa kare gecersiz (durum 4).
+        // quality iki girdide de o KARENIN kalitesi (raw_quality, EMA'siz).
+        gf_input_raw_ = declare_parameter<std::string>("gyroflow_input", "all") == "raw";
         // 17_11: OF2 (infra2 akisi). Kapaliyken opticflow2 alani sifir (quality 0) gider.
         of2_en_ = has_parameter("of2_enable") ? get_parameter("of2_enable").as_bool()
                                                : declare_parameter<bool>("of2_enable", false);
@@ -981,6 +1004,23 @@ private:
         return out;
     }
 
+    // 17_11: tag_sNNNN.csv satiri (iki kamera callback'i -> kendi kilidi)
+    void writeTagCsv(int kam, const isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray &msg,
+                     const lps::TagFusion &f, const lps::TagFusion &fg, const apriltagPack_t &ap)
+    {
+        if (!tag_csv_.is_open()) return;
+        std::string ids;
+        for (const auto &d : msg.detections) { if (!ids.empty()) ids += ';'; ids += std::to_string(d.id); }
+        char b[320];
+        std::snprintf(b, sizeof(b), "%u,%d,%.6f,%zu,%s,%d,%.4f,%.4f,%.4f,%u,%d,%.4f,%.4f,%.4f\n",
+                      msSinceStart(), kam, lps::stampSeconds(msg.header.stamp), msg.detections.size(),
+                      ids.c_str(), f.valid ? 1 : 0, f.pos[0], f.pos[1], f.pos[2], (unsigned)f.id_bits,
+                      fg.valid ? 1 : 0, (double)ap.avgPos.pos.x, (double)ap.avgPos.pos.y, (double)ap.avgPos.pos.z);
+        std::lock_guard<std::mutex> lk(tag_csv_mtx_);
+        tag_csv_ << b;
+        if (++tag_csv_lines_ % 30 == 0) tag_csv_.flush();
+    }
+
     void tagCb(const isaac_ros_apriltag_interfaces::msg::AprilTagDetectionArray::SharedPtr msg)
     {
         tag_cb_count_++;
@@ -991,6 +1031,7 @@ private:
         const lps::TagFusion fg = gateFusion(f, gate1_, lps::stampSeconds(msg->header.stamp), gate1_supp_);
         apriltagPack_t ap = packFromFusion(fg, msSinceStart());
         subtractCamOffset(ap, cam_off1_);   // -> platform merkezine gore
+        writeTagCsv(1, *msg, f, fg, ap);
         if (f.valid && f.pos[2] > 0.1f) {   // IR irtifa kaynagi 'tag' (yer testi)
             tag_z_m_.store(f.pos[2]);
             tag_z_ms_.store(msSinceStart());
@@ -1029,6 +1070,7 @@ private:
         const lps::TagFusion fg = gateFusion(f, gate2_, lps::stampSeconds(msg->header.stamp), gate2_supp_);
         apriltagPack_t ap = packFromFusion(fg, msSinceStart());
         subtractCamOffset(ap, cam_off2_);   // -> platform merkezine gore (aprtiltag2 de)
+        writeTagCsv(2, *msg, f, fg, ap);
         std::lock_guard<std::mutex> lk(data_mutex_);
         apriltag2_  = ap;
         tag2_cap_s_ = lps::stampSeconds(msg->header.stamp);
@@ -1486,7 +1528,7 @@ private:
                 of_ok = gd == (int)GyroFlowDurum::Tamam;
                 if (of_ok) {
                     of.motionPos.x = gs.comp_dx_kare; of.motionPos.y = gs.comp_dy_kare;
-                    if (gf_input_raw_) of.quality = r.raw_quality;   // gonderilen olcumun kendi kalitesi
+                    of.quality = r.raw_quality;   // o karenin kalitesi (EMA'siz, gonderilen olcumle es zamanli)
                 }
                 else if (gf_invalid_q0_) { of.motionPos.x = 0.f; of.motionPos.y = 0.f; of.quality = 0; }
             }
@@ -2330,6 +2372,9 @@ private:
     std::ofstream imu_csv_;   // RealSense IMU 200 Hz ham logu (istege bagli; imu callback'i yazar)
     uint32_t imu_lines_ = 0;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    std::ofstream tag_csv_;   // 17_11 tag kaydi (writeTagCsv, tag_csv_mtx_)
+    std::mutex    tag_csv_mtx_;
+    uint32_t      tag_csv_lines_ = 0;
     std::ofstream rx_csv_;   // otopilot RX kaydi (sadece RX thread'i yazar; dtor RX join'den sonra kapatir)
     uint32_t rx_n4a_ = 0, rx_n4a_ok_ = 0, rx_n42_ = 0, rx_n49_ = 0, rx_nother_ = 0;   // RX thread
     uint64_t ekf_alt_frames_ = 0;   // sadece RX thread'i yazar/okur

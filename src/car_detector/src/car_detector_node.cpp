@@ -63,6 +63,7 @@
 #include <fstream>
 
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -121,6 +122,7 @@ class CarDetector : public rclcpp::Node {
     bool   have_k = false;   // intrinsics var mi (valid=false'un sebebini ayirmak icin)
     double alt = -1;         // boy filtresinin kullandigi irtifa (EKF ya da HRVS); <0: filtre kapali
     int    alt_src = 0;      // ALT_EKF / ALT_HRVS (overlay etiketi)
+    double lat_ms = -1;      // 17_11: tespit edilen karenin cekiminden yayina gecikme (<0: bilinmiyor)
   };
 
   enum { EO = 0, IR = 1 };
@@ -144,6 +146,17 @@ class CarDetector : public rclcpp::Node {
     // son kare zaman damgasi
     std::mutex stamp_mtx;
     builtin_interfaces::msg::Time last_stamp;
+    // 17_11: kare -> cekim damgasi eslemesi. appsrc'ye kendi PTS'imizi yaziyoruz, probe'da
+    // NvDsFrameMeta.buf_pts ile tespit edilen KARENIN damgasini buluyoruz (eskiden yayin, o an
+    // en son itilen karenin damgasini tasiyordu -> gecikme gorunmuyordu). stamp_mtx altinda.
+    std::deque<std::pair<uint64_t, builtin_interfaces::msg::Time>> pts_q;
+    // probe thread'i: islenen karenin damgasi + gecikme istatistigi
+    builtin_interfaces::msg::Time cur_stamp;
+    bool cur_ok = false;
+    uint32_t stamp_hit = 0, stamp_miss = 0;
+    std::vector<float> lat_ms;
+    int64_t lat_log_ns = 0;
+    double pub_lat_ms = -1;
     // kilit durumu (yalniz bu kanalin probe thread'inden erisilir)
     long locked_id = -1;
     double last_u = 0, last_v = 0;
@@ -251,6 +264,13 @@ public:
     // Baslik bayat (> heading_stale_s) ya da INS modu [heading_min_ins, heading_max_ins] disinda ya da yer RTK taze
     // degilse dpsi = 0 (eski davranis).
     foff_use_hdg_   = declare_parameter<bool>("funnel_offset_use_heading", true);
+    // 17_11: kamera montaj (boresight) duzeltmesi [derece]. OKAD .mat (RTK hedef + tutum) ile
+    // gonderilen yon arasinda SABIT aci farki bulundu (s0209/T01, 8464 olcum, D>8 m): x -2.2,
+    // y -1.1 der -> 20-25 m'de ~1 m. Gecikme degil (0-500 ms tarama duz). Gonderilen yon (ofset
+    // dahil) kamera y ekseni etrafinda x_deg, x ekseni etrafinda y_deg dondurulur
+    // (kucuk acida bx += tan(x), by += tan(y)). Otopilota boresight eklenince 0'a cekilmeli.
+    bore_x_rad_ = declare_parameter<double>("car_boresight_x_deg", 0.0) * M_PI / 180.0;
+    bore_y_rad_ = declare_parameter<double>("car_boresight_y_deg", 0.0) * M_PI / 180.0;
     hdg_stale_s_    = declare_parameter<double>("heading_stale_s", 1.0);
     // 15_11 (kullanici): INS modu 0 (izleme yok) DEGILSE kabul (1, 2, 3).
     hdg_min_ins_    = (int)declare_parameter<int>("heading_min_ins", 1);
@@ -326,6 +346,19 @@ public:
     const int record_session = declare_parameter<int>("record_session", 0);
     if (record_video_ && !display_)   // ekran yoksa dosyaya kaydet (IR gibi .avi/MJPG)
       record_path_ = claimRecordPath(record_dir_, "eo", record_session, "avi");
+    // 17_11: kirpik kutu alternatif yon logu (pakete gitmez). Referans arac: s0209 IR kanali
+    // kenara degmeyen kutular boy ~5.4 m (EKF ile), en/boy 0.43.
+    clip_len_m_ = declare_parameter<double>("car_ref_len_m", 5.4);
+    clip_wl_    = declare_parameter<double>("car_ref_wl", 0.43);
+    if (declare_parameter<bool>("clip_csv", true)) {
+      const std::string cp = claimRecordPath(record_dir_, "kirpik", record_session, "csv");
+      clip_csv_.open(cp);
+      if (clip_csv_) {
+        clip_csv_ << "t_ms,kam_t,kanal,irtifa_m,baslik_farki,sol,ust,gen,yuk,kesik(UASG),"
+                     "gen_bek,yuk_bek,u,v,u2,v2,bx,by,bx2,by2\n";
+        RCLCPP_INFO(get_logger(), "Kirpik kutu logu (sadece log, pakete gitmez): %s", cp.c_str());
+      }
+    }
 
     // ---- ROS pub/sub ----
     pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
@@ -409,6 +442,9 @@ public:
         copy_hw_, max_rss_mb_, stall_timeout_s_,
         size_filter_ ? "ACIK" : "KAPALI", len_min_m_, len_max_m_,
         prefer_ekf_ ? ("EKF '" + ekf_topic_ + "', yoksa ").c_str() : "", alt_topic_.c_str(), alt_stale_s_);
+    RCLCPP_INFO(get_logger(), "Huni ofseti (%.2f, %.2f) m | kamera montaj duzeltmesi x %+.2f y %+.2f der%s",
+                foff_x_m_, foff_y_m_, bore_x_rad_ * 180.0 / M_PI, bore_y_rad_ * 180.0 / M_PI,
+                (bore_x_rad_ != 0.0 || bore_y_rad_ != 0.0) ? " (otopilot boresight eklerse 0 yapin)" : "");
     if (dual_)
       RCLCPP_INFO(get_logger(),
           "IKI KAMERA: yuksek=EO '%s' | alcak=IR '%s' (her %d. kare) model '%s' | "
@@ -466,7 +502,7 @@ private:
     GstCaps *caps = gst_caps_from_string(capstr);
     g_free(capstr);
     g_object_set(c.appsrc, "caps", caps, "format", GST_FORMAT_TIME,
-                 "is-live", TRUE, "do-timestamp", TRUE, "block", FALSE, nullptr);
+                 "is-live", TRUE, "do-timestamp", FALSE, "block", FALSE, nullptr);   // PTS'i biz yaziyoruz (17_11)
     gst_caps_unref(caps);
     // Ic kuyruk SINIRLI: en fazla 2 kare, dolunca EN ESKIYI at. Sinirsizken pipeline
     // durunca (19_10 GPU hatasi) her kare (3.7 MB) birikip OOM'a goturdu.
@@ -864,6 +900,15 @@ private:
     // yoksa nvbufsurftransform yanlis kopyalayip cudaErrorIllegalAddress'e dusuyor.
     gst_buffer_add_video_meta(buf, GST_VIDEO_FRAME_FLAG_NONE,
                               GST_VIDEO_FORMAT_RGBA, (guint)W_, (guint)H_);
+    // 17_11: PTS = node basindan beri steady ns (monoton, tekil). Probe'da buf_pts ile
+    // bu karenin ROS cekim damgasina geri donulur.
+    const uint64_t pts = (uint64_t)std::max<int64_t>(1, nowNs() - pts0_ns_);
+    GST_BUFFER_PTS(buf) = pts;
+    {
+      std::lock_guard<std::mutex> lk(c.stamp_mtx);
+      c.pts_q.emplace_back(pts, msg->header.stamp);
+      while (c.pts_q.size() > 64) c.pts_q.pop_front();
+    }
     GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(c.appsrc), buf); // sahiplik gecer
     if (ret != GST_FLOW_OK)
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[%s] appsrc push: %d", c.name, ret);
@@ -906,7 +951,7 @@ private:
       rec_csv_.open(csv);
       if (rec_csv_)
         rec_csv_ << "kare,t_ms,kanal,irtifa_m,irtifa_kaynak,kilit_id,gecerli,bx,by,u,v,conf,olcek,baslik_farki,"
-                    "kutular(id:sol:ust:gen:yuk:conf:kilitli:elendi:boy_m|...)\n";
+                    "gecikme_ms,kutular(id:sol:ust:gen:yuk:conf:kilitli:elendi:boy_m|...)\n";
       else
         RCLCPP_ERROR(get_logger(), "EO CSV acilamadi: %s", csv.c_str());
     }
@@ -921,6 +966,8 @@ private:
       rec_csv_ << line;
       const double dps = relHeadingDeg();
       if (std::isfinite(dps)) { std::snprintf(line, sizeof(line), "%.1f,", dps); rec_csv_ << line; }
+      else rec_csv_ << ',';
+      if (ov.lat_ms >= 0) { std::snprintf(line, sizeof(line), "%.0f,", ov.lat_ms); rec_csv_ << line; }
       else rec_csv_ << ',';
       for (size_t i = 0; i < ov.boxes.size(); ++i) {
         const auto &b = ov.boxes[i];
@@ -1002,6 +1049,14 @@ private:
 
     for (NvDsMetaList *lf = batch->frame_meta_list; lf; lf = lf->next) {
       auto *fm = reinterpret_cast<NvDsFrameMeta *>(lf->data);
+      // 17_11: bu karenin cekim damgasi (buf_pts -> appsrc'de yazdigimiz PTS)
+      c.cur_ok = false;
+      {
+        std::lock_guard<std::mutex> lk(c.stamp_mtx);
+        for (auto it = c.pts_q.rbegin(); it != c.pts_q.rend(); ++it)
+          if (it->first == fm->buf_pts) { c.cur_stamp = it->second; c.cur_ok = true; break; }
+      }
+      if (c.cur_ok) ++c.stamp_hit; else ++c.stamp_miss;
       const SizeGate g = sizeGate(c);
       std::vector<Cand> cands, rejected;
       for (NvDsMetaList *lo = fm->obj_meta_list; lo; lo = lo->next) {
@@ -1097,6 +1152,7 @@ private:
     ov.locked_id = c.locked_id;
     ov.bx = c.pub_bx; ov.by = c.pub_by; ov.u = c.pub_u; ov.v = c.pub_v;
     ov.conf = (float)c.pub_conf; ov.valid = c.pub_valid;
+    ov.lat_ms = c.pub_valid ? c.pub_lat_ms : -1;
     { std::lock_guard<std::mutex> lk(c.k_mtx); ov.have_k = c.have_K; }
     std::lock_guard<std::mutex> lk(c.rec_ov_mtx);
     c.rec_ov = std::move(ov);
@@ -1174,7 +1230,7 @@ private:
       c.pub_conf = best->conf;
       RCLCPP_INFO(get_logger(), "[%s] KILIT acildi -> id=%ld @(%.0f,%.0f) conf=%.2f L=%.1fm",
                   c.name, best->id, best->u, best->v, best->conf, best->len_m);
-      publishBearing(c, best->id, best->u, best->v);
+      publishBearing(c, best->id, best->u, best->v, &best->om->rect_params);
       return;
     }
 
@@ -1197,7 +1253,7 @@ private:
       updateVel(c, match->u - c.last_u, match->v - c.last_v);
       c.last_u = match->u; c.last_v = match->v; c.lost = 0;
       c.pub_conf = match->conf;
-      publishBearing(c, match->id, match->u, match->v);
+      publishBearing(c, match->id, match->u, match->v, &match->om->rect_params);
       return;
     }
 
@@ -1218,7 +1274,7 @@ private:
       updateVel(c, only->u - c.last_u, only->v - c.last_v);
       lockTo(c, only->id, only->u, only->v, false);
       c.pub_conf = only->conf;
-      publishBearing(c, only->id, only->u, only->v);
+      publishBearing(c, only->id, only->u, only->v, &only->om->rect_params);
       return;
     }
 
@@ -1253,19 +1309,36 @@ private:
     }
   }
 
-  void publishBearing(Chan &c, long track_id, double u, double v) {
+  void publishBearing(Chan &c, long track_id, double u, double v,
+                      const NvOSD_RectParams *rect = nullptr) {
     c.pub_u = u; c.pub_v = v;   // olculen piksel — intrinsics olmasa da overlay icin sakla
+    double bx, by;
+    if (!pixToBearing(c, u, v, bx, by)) { c.pub_valid = false; return; }  // intrinsics yok
+    c.pub_bx = bx; c.pub_by = by; c.pub_valid = true;  // display icin sakla
+    if (c.idx != active_.load()) return;  // isinma kanali: kilit tutar, yayinlamaz
+    geometry_msgs::msg::Vector3Stamped m;
+    m.header.stamp = frameStamp(c);
+    noteLatency(c, m.header.stamp);
+    m.header.frame_id = "camera";
+    m.vector.x = bx;
+    m.vector.y = by;
+    m.vector.z = (double)track_id;   // >=0 gecerli
+    pub_->publish(m);
+    if (rect) logClipped(c, *rect, u, v, bx, by, m.header.stamp);   // 17_11 sadece LOG
+  }
+
+  // Piksel -> gonderilen yon: bozulma duzeltme, (IR ise) renkli kamera cercevesi, huni ofseti,
+  // kamera montaj duzeltmesi. Intrinsics yoksa false.
+  bool pixToBearing(Chan &c, double u, double v, double &bx, double &by) {
     cv::Mat K, D;
-    bool haveK;
     {
       std::lock_guard<std::mutex> lk(c.k_mtx);
-      haveK = c.have_K;
-      if (haveK) { K = c.K.clone(); D = c.D.clone(); }
+      if (!c.have_K) return false;
+      K = c.K.clone(); D = c.D.clone();
     }
-    if (!haveK) { c.pub_valid = false; return; }  // intrinsics yok -> yon uretemeyiz
     std::vector<cv::Point2d> in{cv::Point2d(u, v)}, out;
     cv::undistortPoints(in, out, K, D);   // normalize (X/Z, Y/Z), bu kameranin cercevesi
-    double bx = out[0].x, by = out[0].y;
+    bx = out[0].x; by = out[0].y;
     if (c.idx == IR) irToColor(bx, by);  // paket RENKLI kamera cercevesinde kalsin
     // Huni ofseti: sadece taze irtifayla (yoksa kutu merkezi gider).
     if (foff_x_m_ != 0.0 || foff_y_m_ != 0.0) {
@@ -1286,22 +1359,88 @@ private:
         by += k * oy / alt;
       }
     }
-    c.pub_bx = bx; c.pub_by = by; c.pub_valid = true;  // display icin sakla
-    if (c.idx != active_.load()) return;  // isinma kanali: kilit tutar, yayinlamaz
-    geometry_msgs::msg::Vector3Stamped m;
-    { std::lock_guard<std::mutex> lk(c.stamp_mtx); m.header.stamp = c.last_stamp; }
-    m.header.frame_id = "camera";
-    m.vector.x = bx;
-    m.vector.y = by;
-    m.vector.z = (double)track_id;   // >=0 gecerli
-    pub_->publish(m);
+    if (bore_x_rad_ != 0.0 || bore_y_rad_ != 0.0) {   // 17_11 montaj duzeltmesi (bkz. parametre)
+      const double cx = std::cos(bore_x_rad_), sx = std::sin(bore_x_rad_);
+      const double cy = std::cos(bore_y_rad_), sy = std::sin(bore_y_rad_);
+      const double X = bx * cx + sx, Z = -bx * sx + cx;          // kamera y ekseni etrafinda
+      const double Y = by * cy + Z * sy, Z2 = -by * sy + Z * cy; // kamera x ekseni etrafinda
+      bx = X / Z2; by = Y / Z2;
+    }
+    return true;
+  }
+
+  // 17_11 (KULLANICI: sadece ayri log, pakete GITMEZ): kilitli kutu kadraj kenarina degiyorsa
+  // arac kesik -> kutu merkezi huniden kayar (s0209 ~900 s: kalan +0.99 m). Kesilmeyen kenardan
+  // + beklenen arac boyutundan (boy car_ref_len_m, en = boy * car_ref_wl; baslik farkiyla
+  // dondurulmus eksen-hizali kutu) alternatif merkez -> ayni yon hesabi -> kirpik_sNNNN.csv.
+  // Kesik degilse u2 = u (karsilastirma icin her gecerli karede satir yazilir).
+  void logClipped(Chan &c, const NvOSD_RectParams &r, double u, double v, double bx, double by,
+                  const builtin_interfaces::msg::Time &st) {
+    if (!clip_csv_.is_open()) return;
+    const double l = r.left, t = r.top, rr = r.left + r.width, b = r.top + r.height;
+    const bool eL = l <= edge_px_, eR = rr >= W_ - edge_px_, eT = t <= edge_px_, eB = b >= H_ - edge_px_;
+    const SizeGate g = sizeGate(c);
+    const double dps = relHeadingDeg();
+    double u2 = u, v2 = v, wexp = -1, hexp = -1;
+    if (g.on && (eL || eR || eT || eB)) {
+      const double Z = slantZ(g, u, v);
+      const double a = std::isfinite(dps) ? dps * M_PI / 180.0 : 0.0;
+      const double L = clip_len_m_, Wd = clip_len_m_ * clip_wl_;
+      hexp = (L * std::fabs(std::cos(a)) + Wd * std::fabs(std::sin(a))) * g.fy / Z;   // goruntu y
+      wexp = (L * std::fabs(std::sin(a)) + Wd * std::fabs(std::cos(a))) * g.fx / Z;   // goruntu x
+      if (eT != eB && hexp > r.height) v2 = eT ? b - hexp * 0.5 : t + hexp * 0.5;
+      if (eL != eR && wexp > r.width)  u2 = eL ? rr - wexp * 0.5 : l + wexp * 0.5;
+    }
+    double bx2 = bx, by2 = by;
+    if (u2 != u || v2 != v) pixToBearing(c, u2, v2, bx2, by2);
+    char kes[5] = "----";
+    if (eT) kes[0] = 'U'; if (eB) kes[1] = 'A'; if (eL) kes[2] = 'S'; if (eR) kes[3] = 'G';
+    const double t_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_start_).count();
+    char line[400];
+    std::snprintf(line, sizeof(line),
+        "%.0f,%.6f,%s,%.2f,%s,%.0f,%.0f,%.0f,%.0f,%s,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.5f,%.5f,%.5f,%.5f\n",
+        t_ms, rclcpp::Time(st, RCL_ROS_TIME).seconds(), c.name, g.on ? g.alt : -1.0,
+        std::isfinite(dps) ? std::to_string(dps).c_str() : "", l, t, r.width, r.height, kes,
+        wexp, hexp, u, v, u2, v2, bx, by, bx2, by2);
+    std::lock_guard<std::mutex> lk(clip_mtx_);
+    clip_csv_ << line;
+    if (++clip_lines_ % 30 == 0) clip_csv_.flush();
+  }
+
+  // 17_11: tespit edilen karenin cekim damgasi; eslesmediyse (eski davranis) son itilen kare.
+  builtin_interfaces::msg::Time frameStamp(Chan &c) {
+    if (c.cur_ok) return c.cur_stamp;
+    std::lock_guard<std::mutex> lk(c.stamp_mtx);
+    return c.last_stamp;
+  }
+  // Cekimden yayina gecikme (sistem saati; NTP adiminda anlamsiz degerler atilir). 10 s'de bir log.
+  void noteLatency(Chan &c, const builtin_interfaces::msg::Time &st) {
+    const double ms = (get_clock()->now() - rclcpp::Time(st, RCL_ROS_TIME)).seconds() * 1000.0;
+    c.pub_lat_ms = (c.cur_ok && ms >= 0.0 && ms < 5000.0) ? ms : -1;
+    if (c.pub_lat_ms >= 0) c.lat_ms.push_back((float)c.pub_lat_ms);
+    const int64_t now = nowNs();
+    if (c.lat_log_ns == 0) c.lat_log_ns = now;
+    if (now - c.lat_log_ns < 10'000'000'000LL) return;
+    c.lat_log_ns = now;
+    const uint32_t tot = c.stamp_hit + c.stamp_miss;
+    if (!c.lat_ms.empty()) {
+      std::vector<float> v = c.lat_ms;
+      std::sort(v.begin(), v.end());
+      RCLCPP_INFO(get_logger(), "[CAR-GECIKME] %s cekim->yayin medyan %.0f p90 %.0f max %.0f ms (n=%zu) | "
+                  "damga eslesmeyen %u/%u", c.name, v[v.size() / 2], v[v.size() * 9 / 10], v.back(),
+                  v.size(), c.stamp_miss, tot);
+    } else {
+      RCLCPP_INFO(get_logger(), "[CAR-GECIKME] %s olcum yok | damga eslesmeyen %u/%u", c.name, c.stamp_miss, tot);
+    }
+    c.lat_ms.clear(); c.stamp_hit = c.stamp_miss = 0;
   }
 
   void publishInvalid(Chan &c) {
     c.pub_valid = false;
     if (c.idx != active_.load()) return;
     geometry_msgs::msg::Vector3Stamped m;
-    { std::lock_guard<std::mutex> lk(c.stamp_mtx); m.header.stamp = c.last_stamp; }
+    m.header.stamp = frameStamp(c);
     m.header.frame_id = "camera";
     m.vector.x = 0.0; m.vector.y = 0.0; m.vector.z = -1.0;
     pub_->publish(m);
@@ -1342,6 +1481,7 @@ private:
   std::array<std::unique_ptr<Chan>, 2> ch_;
   bool   dual_ = false;
   double down_m_ = 12.0, up_m_ = 18.0, alt_lost_s_ = 10.0, alt_keep_s_ = 120.0;
+  const int64_t pts0_ns_ = nowNs();   // 17_11: appsrc PTS orijini
   int64_t start_ns_ = 0;   // node baslangici (hic irtifa gelmediyse EO karari icin)
   std::atomic<int> active_{EO};
   std::mutex mode_mtx_;
@@ -1367,6 +1507,11 @@ private:
   bool         writer_open_ = false;
   bool         record_overlay_ = true;
   double       foff_x_m_ = 0.0, foff_y_m_ = 0.0, foff_zero_m_ = 3.0, foff_full_m_ = 6.0;
+  double       bore_x_rad_ = 0.0, bore_y_rad_ = 0.0;   // 17_11 kamera montaj duzeltmesi
+  double       clip_len_m_ = 5.4, clip_wl_ = 0.43;      // 17_11 kirpik kutu logu
+  std::ofstream clip_csv_;
+  std::mutex    clip_mtx_;
+  uint32_t      clip_lines_ = 0;
   // dron - arac basligi (0x4A, serial_sender -> /autopilot/heading)
   bool         foff_use_hdg_ = true;
   double       hdg_stale_s_ = 1.0;

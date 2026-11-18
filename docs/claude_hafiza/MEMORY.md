@@ -16,3 +16,4 @@
 - [HRVS açılış takılması](hrvs-startup-hang.md) — restart sonrası hrvsConfiguration sonsuz bekliyordu; PH.07 500 ms reset darbesi + steady_clock + bekçi ile düzeltildi; SDK debug logu (radar sıcaklıkları) varsayılan açık (20_10)
 - [Yeni Jetson kurulum dokümanı](new-jetson-setup-doc.md) — YENI_JETSON.md + README (07_11); sistem ayarı değişirse oraya da yaz; eski GDNS.service taşınmamalı
 - [Huni tag kalibrasyonu 05_11](funnel-tag-calibration.md) — referans = küçük tag plakası; duvar (0,.3004,-.0959) 26 cm; küçük 10/12/14/16 65 mm x ±4.5, y +7.54/−6.46 cm z=0 (canlı doğrulandı; 10/16 nadir, kablo); 25h9 sahte tespit filtresi; canlı kalibrasyon tuzakları
+- [Uçuşlar 209/210 17_11](flights-209-210.md) — havada NTP adımı → akış 18 s kesik; HRVS kalkışta koptu; huni yönü OKAD .mat RTK ile: SABİT ~2–3° kamera açı farkı (20–25 m'de 1–2 m), gecikme değil; gyroflow girdisi uçuşta all daha iyi
